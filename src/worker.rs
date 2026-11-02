@@ -22,6 +22,7 @@ use std::{
 
 pub enum Command {
     Refresh,
+    SyncHistory,
     SyncContacts,
     Send {
         phone: String,
@@ -39,6 +40,7 @@ pub enum Event {
     NotificationError(String),
     Contacts(Book),
     ContactsStatus(bool, String),
+    StorageError(String),
 }
 
 #[derive(Deserialize, Default)]
@@ -103,6 +105,9 @@ fn listing(xml: &str, outgoing: bool) -> io::Result<Vec<Message>> {
         .collect())
 }
 pub fn refresh(cache: &mut Vec<Message>) -> io::Result<()> {
+    refresh_history(cache, false)
+}
+fn refresh_history(cache: &mut Vec<Message>, history: bool) -> io::Result<()> {
     let address = transport::find_iphone()?;
     let mut session = MapClient::connect(address)?;
     let mut records = listing(&session.list("inbox")?, false)?;
@@ -110,6 +115,36 @@ pub fn refresh(cache: &mut Vec<Message>) -> io::Result<()> {
         && let Ok(sent) = listing(&xml, true)
     {
         records.extend(sent);
+    }
+    if history {
+        for (folder, outgoing) in [("inbox", false), ("sent", true)] {
+            let mut offset = records
+                .iter()
+                .filter(|message| message.outgoing == outgoing)
+                .count() as u16;
+            let mut ids: HashSet<_> = records.iter().map(|message| message.id.clone()).collect();
+            while offset > 0 {
+                let Ok(xml) = session.list_page(folder, offset, 100) else {
+                    break;
+                };
+                let page = listing(&xml, outgoing)?;
+                let count = page.len() as u16;
+                let mut added = 0;
+                for message in page {
+                    if ids.insert(message.id.clone()) {
+                        records.push(message);
+                        added += 1;
+                    }
+                }
+                if added == 0 {
+                    break;
+                }
+                let Some(next) = offset.checked_add(count) else {
+                    break;
+                };
+                offset = next;
+            }
+        }
     }
     let known: HashSet<String> = cache.iter().map(|m| m.id.clone()).collect();
     for mut message in records {
@@ -128,10 +163,22 @@ pub fn refresh(cache: &mut Vec<Message>) -> io::Result<()> {
         }
     }
     cache.sort_by_key(|m| m.timestamp);
-    if cache.len() > 2000 {
-        cache.drain(..cache.len() - 2000);
-    }
     Ok(())
+}
+pub fn history_probe() -> io::Result<serde_json::Value> {
+    let mut session = MapClient::connect(transport::find_iphone()?)?;
+    let mut seen = HashSet::new();
+    let mut pages = Vec::new();
+    for offset in [0, 10, 20, 30] {
+        let xml = session.list_page("inbox", offset, 10)?;
+        let entries = listing(&xml, false)?;
+        let new = entries
+            .iter()
+            .filter(|entry| seen.insert(entry.id.clone()))
+            .count();
+        pages.push(serde_json::json!({"offset":offset,"records":entries.len(),"new_records":new}));
+    }
+    Ok(serde_json::json!({"pages":pages,"distinct":seen.len()}))
 }
 pub fn attachment_probe() -> io::Result<serde_json::Value> {
     let mut session = MapClient::connect(transport::find_iphone()?)?;
@@ -168,6 +215,7 @@ pub fn start(
     ctx: egui::Context,
     path: PathBuf,
     book: Arc<Mutex<Book>>,
+    preferences: Arc<Mutex<crate::settings::Settings>>,
 ) -> (Sender<Command>, Receiver<Event>) {
     let (commands, rx) = mpsc::channel();
     let (tx, events) = mpsc::channel();
@@ -176,17 +224,22 @@ pub fn start(
             let _ = tx.send(event);
             ctx.request_repaint();
         };
+        let mut writable = true;
         let mut cache = match model::load(&path) {
             Ok(records) => records,
             Err(_) => {
-                emit(Event::Connection(
-                    false,
-                    "История не открылась; подключаю iPhone…".into(),
-                ));
+                writable = false;
+                emit(Event::StorageError("Сохранённая история не открылась. Исходный файл сохранён; новые сообщения временно остаются в памяти.".into()));
                 vec![]
             }
         };
         emit(Event::Snapshot(cache.clone()));
+        let mut saved_cache = cache.clone();
+        let save = |cache: &Vec<Message>, saved: &mut Vec<Message>, enabled: bool| {
+            if enabled && writable && cache != saved {
+                match model::save(&path,cache){Ok(())=>*saved=cache.clone(),Err(_)=>emit(Event::StorageError("Не удалось сохранить историю. Проверь свободное место и доступ к папке данных.".into()))}
+            }
+        };
         let mut notification_tracker = NotificationTracker::default();
         let mut notifications = match Notifications::new() {
             Ok(notifications) => Some(notifications),
@@ -197,6 +250,7 @@ pub fn start(
         };
         let mut first = true;
         let mut initial_contacts = true;
+        let mut was_connected = false;
         let sync_contacts = || {
             emit(Event::ContactsStatus(
                 true,
@@ -227,56 +281,74 @@ pub fn start(
             }
         };
         loop {
+            let settings = preferences
+                .lock()
+                .map(|settings| settings.clone())
+                .unwrap_or_default();
             let command = if first {
                 first = false;
                 Command::Refresh
             } else {
-                match rx.recv_timeout(Duration::from_secs(3)) {
+                match rx.recv_timeout(Duration::from_secs(settings.poll_seconds)) {
                     Ok(command) => command,
                     Err(mpsc::RecvTimeoutError::Timeout) => Command::Refresh,
                     Err(_) => break,
                 }
             };
+            // Preferences can change while recv_timeout waits for a command.
+            let settings = preferences
+                .lock()
+                .map(|settings| settings.clone())
+                .unwrap_or_default();
             match command {
                 Command::Stop => break,
                 Command::SyncContacts => sync_contacts(),
-                Command::Refresh => match refresh(&mut cache) {
-                    Ok(()) => {
-                        for message in notification_tracker.observe(&cache) {
-                            if let Some(notifications) = &mut notifications {
-                                let title = book
-                                    .lock()
-                                    .map(|book| book.display(&message.phone, &message.name))
-                                    .unwrap_or_else(|_| model::format_phone(&message.phone));
-                                let phone = message.phone.clone();
-                                let events = tx.clone();
-                                let context = ctx.clone();
-                                let click = std::sync::Arc::new(move || {
-                                    let _ = events.send(Event::OpenConversation(phone.clone()));
-                                    context.request_repaint();
-                                });
-                                if let Err(error) =
-                                    notifications.show(&title, &message.text, Some(click))
-                                {
-                                    emit(Event::NotificationError(error));
+                Command::Refresh | Command::SyncHistory => {
+                    let historical = matches!(command, Command::SyncHistory)
+                        || (!was_connected && settings.sync_history_on_connect);
+                    match refresh_history(&mut cache, historical) {
+                        Ok(()) => {
+                            was_connected = true;
+                            for message in notification_tracker.observe(&cache) {
+                                if historical || !settings.notifications {
+                                    continue;
+                                }
+                                if let Some(notifications) = &mut notifications {
+                                    let title = book
+                                        .lock()
+                                        .map(|book| book.display(&message.phone, &message.name))
+                                        .unwrap_or_else(|_| model::format_phone(&message.phone));
+                                    let phone = message.phone.clone();
+                                    let events = tx.clone();
+                                    let context = ctx.clone();
+                                    let click = std::sync::Arc::new(move || {
+                                        let _ = events.send(Event::OpenConversation(phone.clone()));
+                                        context.request_repaint();
+                                    });
+                                    if let Err(error) = notifications.show_with_sound(
+                                        &title,
+                                        &message.text,
+                                        Some(click),
+                                        settings.notification_sound,
+                                    ) {
+                                        emit(Event::NotificationError(error));
+                                    }
                                 }
                             }
+                            emit(Event::Snapshot(cache.clone()));
+                            emit(Event::Connection(true, "iPhone подключён".into()));
+                            save(&cache, &mut saved_cache, settings.save_history);
+                            if initial_contacts {
+                                initial_contacts = false;
+                                sync_contacts();
+                            }
                         }
-                        emit(Event::Snapshot(cache.clone()));
-                        emit(Event::Connection(true, "iPhone подключён".into()));
-                        if model::save(&path, &cache).is_err() {
-                            emit(Event::Connection(
-                                true,
-                                "Подключён · история только в памяти".into(),
-                            ));
-                        }
-                        if initial_contacts {
-                            initial_contacts = false;
-                            sync_contacts();
+                        Err(error) => {
+                            was_connected = false;
+                            emit(Event::Connection(false, error.to_string()));
                         }
                     }
-                    Err(error) => emit(Event::Connection(false, error.to_string())),
-                },
+                }
                 Command::Send {
                     phone,
                     target,
@@ -303,7 +375,7 @@ pub fn start(
                         state: SendState::Pending,
                     };
                     cache.push(message);
-                    let _ = model::save(&path, &cache);
+                    save(&cache, &mut saved_cache, settings.save_history);
                     emit(Event::Snapshot(cache.clone()));
                     // No retries: a lost acknowledgement must never duplicate a real message.
                     let result = transport::find_iphone()
@@ -324,7 +396,7 @@ pub fn start(
                             emit(Event::SendFailed("Проверь сообщение на iPhone перед повтором: оно могло уйти. Черновик сохранён.".into()));
                         }
                     }
-                    let _ = model::save(&path, &cache);
+                    save(&cache, &mut saved_cache, settings.save_history);
                     emit(Event::Snapshot(cache.clone()));
                 }
             }

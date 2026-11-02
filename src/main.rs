@@ -1,4 +1,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+mod capabilities;
 mod composer;
 mod contacts;
 mod emoji;
@@ -8,6 +9,8 @@ mod media;
 mod model;
 mod motion;
 mod notifications;
+mod platform;
+mod settings;
 mod transport;
 mod ui;
 mod worker;
@@ -15,6 +18,22 @@ mod worker;
 fn main() -> eframe::Result {
     let _ = notifications::set_app_identity();
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--probe-capabilities") {
+        let result = capabilities::probe();
+        let report = serde_json::json!({"ok":result.is_ok(),"result":result.as_ref().ok(),"error":result.as_ref().err()});
+        let _ = std::fs::write(
+            model::diagnostics_dir().join("capabilities-probe.json"),
+            serde_json::to_vec_pretty(&report).unwrap(),
+        );
+        std::process::exit(if result.is_ok() { 0 } else { 1 });
+    }
+    if args.iter().any(|a| a == "--probe-history") {
+        let result = worker::history_probe();
+        let report = serde_json::json!({"ok":result.is_ok(),"result":result.as_ref().ok(),"error":result.as_ref().err().map(ToString::to_string)});
+        let path = model::diagnostics_dir().join("history-probe.json");
+        let _ = std::fs::write(path, serde_json::to_vec_pretty(&report).unwrap());
+        std::process::exit(if result.is_ok() { 0 } else { 1 });
+    }
     if args.iter().any(|a| a == "--repair-shortcuts") {
         std::process::exit(if notifications::Notifications::new().is_ok() {
             0
@@ -25,24 +44,14 @@ fn main() -> eframe::Result {
     if args.iter().any(|a| a == "--probe-contacts") {
         let result = transport::find_iphone().and_then(contacts::probe);
         let report = serde_json::json!({"ok":result.is_ok(),"result":result.as_ref().ok(),"error":result.as_ref().err().map(ToString::to_string)});
-        let path = model::data_path()
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("build/contacts-probe.json");
+        let path = model::diagnostics_dir().join("contacts-probe.json");
         let _ = std::fs::write(path, serde_json::to_vec_pretty(&report).unwrap());
         std::process::exit(if result.is_ok() { 0 } else { 1 });
     }
     if args.iter().any(|a| a == "--probe-attachments") {
         let result = worker::attachment_probe();
         let report = serde_json::json!({"ok":result.is_ok(),"result":result.as_ref().ok(),"error":result.as_ref().err().map(ToString::to_string)});
-        let path = model::data_path()
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("build/attachment-probe.json");
+        let path = model::diagnostics_dir().join("attachment-probe.json");
         let _ = std::fs::write(path, serde_json::to_vec_pretty(&report).unwrap());
         std::process::exit(if result.is_ok() { 0 } else { 1 });
     }
@@ -63,12 +72,7 @@ fn main() -> eframe::Result {
                 )
             });
         let report = serde_json::json!({"ok":result.is_ok(),"error":result.as_ref().err()});
-        let path = model::data_path()
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("build/notification-test.json");
+        let path = model::diagnostics_dir().join("notification-test.json");
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -90,13 +94,7 @@ fn main() -> eframe::Result {
         let mut messages = Vec::new();
         let result = worker::refresh(&mut messages);
         let report = serde_json::json!({"ok":result.is_ok(),"messages":messages.len(),"text_received":messages.iter().any(|m|!m.text.is_empty()),"error":result.as_ref().err().map(ToString::to_string)});
-        let report_path = model::data_path()
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("build")
-            .join("probe.json");
+        let report_path = model::diagnostics_dir().join("probe.json");
         if let Some(parent) = report_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -110,7 +108,7 @@ fn main() -> eframe::Result {
             .with_inner_size(if compact { [830., 570.] } else { [1120., 760.] })
             .with_min_inner_size([830., 570.])
             .with_decorations(false)
-            .with_transparent(true)
+            .with_transparent(false)
             .with_icon(ui::app_icon()),
         renderer: eframe::Renderer::Glow,
         ..Default::default()

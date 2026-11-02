@@ -69,17 +69,19 @@ pub struct MessagesApp {
     contacts_status: String,
     contacts_syncing: bool,
     motion: crate::motion::Motion,
+    focus_draft: bool,
+    submitted: Option<(String, String)>,
+    preferences: crate::settings::Settings,
+    shared_preferences: Arc<Mutex<crate::settings::Settings>>,
+    settings_open: bool,
+    settings_draft: crate::settings::Settings,
+    settings_status: String,
 }
 
 pub fn setup(ctx: &Context) {
     ctx.set_theme(Theme::Light);
     let mut fonts = FontDefinitions::default();
-    let font_root = model::data_path()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("assets/fonts");
+    let font_root = model::app_root().join("assets/fonts");
     for (name, path) in [
         ("SF Pro", font_root.join("SF-Pro-Text-Regular.otf")),
         ("Semibold", font_root.join("SF-Pro-Text-Semibold.otf")),
@@ -132,11 +134,36 @@ pub fn setup(ctx: &Context) {
 
 impl MessagesApp {
     pub fn new(cc: &eframe::CreationContext<'_>, preview: bool) -> Self {
-        Self::from_context(&cc.egui_ctx, preview)
+        let rounded = crate::platform::round_window(cc);
+        let mut app = Self::from_context(&cc.egui_ctx, preview);
+        if let Err(error) = rounded {
+            app.settings_status = format!("Скругление окна недоступно: {error}");
+        }
+        app
     }
     fn from_context(ctx: &Context, preview: bool) -> Self {
         setup(ctx);
-        let motion = crate::motion::Motion::new();
+        let migration = if preview {
+            Ok(0)
+        } else {
+            model::migrate_legacy()
+        };
+        let loaded = if preview {
+            Ok(crate::settings::Settings::default())
+        } else {
+            crate::settings::Settings::load(&model::data_dir().join("settings.bin"))
+        };
+        let settings_status = if let Err(error) = &loaded {
+            format!("Настройки не открылись: {error}")
+        } else if let Err(error) = migration {
+            format!("Не удалось перенести данные: {error}")
+        } else {
+            String::new()
+        };
+        let preferences = loaded.unwrap_or_default();
+        let shared_preferences = Arc::new(Mutex::new(preferences.clone()));
+        let mut motion = crate::motion::Motion::new();
+        motion.enabled &= preferences.animations;
         ctx.style_mut_of(Theme::Light, |style| {
             style.animation_time = if motion.enabled {
                 crate::motion::POPUP_TIME
@@ -144,12 +171,7 @@ impl MessagesApp {
                 0.
             }
         });
-        let emoji_root = model::data_path()
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("assets/emoji");
+        let emoji_root = model::app_root().join("assets/emoji");
         let emoji_catalog = Catalog::load(&emoji_root).ok();
         if let Some(catalog) = &emoji_catalog {
             catalog.install(ctx);
@@ -169,7 +191,12 @@ impl MessagesApp {
         let (commands, events) = if preview {
             (None, None)
         } else {
-            let (c, e) = worker::start(ctx.clone(), model::data_path(), shared_contacts.clone());
+            let (c, e) = worker::start(
+                ctx.clone(),
+                model::data_path(),
+                shared_contacts.clone(),
+                shared_preferences.clone(),
+            );
             (Some(c), Some(e))
         };
         let mut app = Self {
@@ -208,9 +235,37 @@ impl MessagesApp {
             contacts_status,
             contacts_syncing: false,
             motion,
+            focus_draft: false,
+            submitted: None,
+            settings_draft: preferences.clone(),
+            preferences,
+            shared_preferences,
+            settings_open: false,
+            settings_status,
         };
         if preview {
             app.seed_preview();
+        } else if app.preferences.save_drafts {
+            match crate::settings::Drafts::load(&model::data_dir().join("drafts.bin")) {
+                Ok(saved) => {
+                    app.drafts = saved.messages;
+                    app.selected = saved.selected;
+                    app.new_mode = saved.new_mode;
+                    app.recipient = saved.recipient;
+                    if let Some(phone) = &app.selected {
+                        app.draft = app.drafts.remove(phone).unwrap_or_default();
+                    } else if app.new_mode {
+                        app.draft = app.drafts.remove("").unwrap_or_default();
+                    }
+                    if saved.uncertain_submission {
+                        app.error = Some(
+                            "Предыдущая отправка могла завершиться. Проверь iPhone перед повтором."
+                                .into(),
+                        );
+                    }
+                }
+                Err(error) => app.error = Some(format!("Черновики не открылись: {error}")),
+            }
         }
         app
     }
@@ -222,6 +277,7 @@ impl MessagesApp {
             .unwrap_or_default();
         for event in events {
             match event {
+                Event::StorageError(error) => self.error = Some(error),
                 Event::Snapshot(messages) => {
                     if self.connected {
                         self.motion.register(&self.messages, &messages);
@@ -233,7 +289,10 @@ impl MessagesApp {
                         && !self.new_mode
                         && let Some(c) = self.conversations.first()
                     {
-                        self.selected = Some(c.phone.clone());
+                        let phone = c.phone.clone();
+                        self.selected = Some(phone.clone());
+                        self.draft = self.drafts.remove(&phone).unwrap_or_default();
+                        self.focus_draft = !self.settings_open;
                     }
                     if changed {
                         self.scroll_to_bottom = true;
@@ -251,9 +310,12 @@ impl MessagesApp {
                 }
                 Event::Sent(phone) => {
                     self.sending = false;
-                    self.drafts.remove(&phone);
-                    if self.selected.as_deref() == Some(&phone) {
-                        self.draft.clear();
+                    if self
+                        .submitted
+                        .as_ref()
+                        .is_some_and(|(target, _)| target == &phone)
+                    {
+                        self.submitted = None;
                     }
                     self.scroll_to_bottom = true;
                 }
@@ -280,6 +342,16 @@ impl MessagesApp {
                 }
                 Event::SendFailed(error) => {
                     self.sending = false;
+                    if let Some((phone, text)) = self.submitted.take() {
+                        if self.selected.as_deref() == Some(&phone) {
+                            if self.draft.is_empty() {
+                                self.draft = text;
+                                self.focus_draft = true;
+                            }
+                        } else if self.drafts.get(&phone).is_none_or(String::is_empty) {
+                            self.drafts.insert(phone, text);
+                        }
+                    }
                     self.error = Some(error);
                 }
             }
@@ -402,9 +474,7 @@ impl MessagesApp {
         }
     }
     fn select(&mut self, phone: &str) {
-        if self.sending {
-            return;
-        }
+        self.focus_draft = !self.settings_open;
         if self.selected.as_deref() != Some(phone) {
             self.motion.switch_dialogue();
         }
@@ -419,9 +489,7 @@ impl MessagesApp {
         self.scroll_to_bottom = true;
     }
     fn new_conversation(&mut self) {
-        if self.sending {
-            return;
-        }
+        self.focus_draft = false;
         self.drafts.insert(
             self.selected.clone().unwrap_or_default(),
             self.draft.clone(),
@@ -459,9 +527,12 @@ impl MessagesApp {
                 })
                 .is_ok()
             {
+                self.submitted = Some((phone.clone(), std::mem::take(&mut self.draft)));
+                self.drafts.remove(&phone);
                 self.selected = Some(phone);
                 self.new_mode = false;
                 self.sending = true;
+                self.focus_draft = true;
                 self.error = None;
                 self.scroll_to_bottom = true;
             } else {
@@ -482,7 +553,7 @@ impl MessagesApp {
             })
     }
     fn sidebar(&mut self, ui: &mut Ui, rect: Rect) {
-        ui.painter().rect_filled(rect, 18, SIDE);
+        ui.painter().rect_filled(rect, 0, SIDE);
         let drag = Rect::from_min_max(
             pos2(rect.left() + 76., rect.top()),
             pos2(rect.right() - 40., rect.top() + 35.),
@@ -629,11 +700,7 @@ impl MessagesApp {
                                 Sense::click(),
                             );
                             response.widget_info(|| {
-                                WidgetInfo::labeled(
-                                    Role::ListBoxOption,
-                                    !self.sending,
-                                    &conversation.name,
-                                )
+                                WidgetInfo::labeled(Role::ListBoxOption, true, &conversation.name)
                             });
                             let selected = self.selected.as_deref() == Some(&conversation.phone)
                                 && !self.new_mode;
@@ -714,7 +781,16 @@ impl MessagesApp {
                     });
             },
         );
-        let center = pos2(rect.center().x, rect.bottom() - 13.);
+        let settings_button = ui
+            .put(
+                Rect::from_min_size(pos2(rect.left() + 9., rect.bottom() - 31.), vec2(30., 26.)),
+                Button::new("⚙").frame(false),
+            )
+            .on_hover_text("Настройки · Ctrl+,");
+        if settings_button.clicked() {
+            self.open_settings();
+        }
+        let center = pos2(rect.center().x + 12., rect.bottom() - 15.);
         let status = if self.preview {
             "Предпросмотр · без подключения"
         } else {
@@ -739,14 +815,7 @@ impl MessagesApp {
 
     fn header(&mut self, ui: &mut Ui, rect: Rect) {
         let compose = Rect::from_min_size(pos2(rect.left() + 10., rect.top() + 8.), vec2(32., 32.));
-        if icon_button(
-            ui,
-            compose,
-            Icon::Compose,
-            "Новое сообщение · Ctrl+N",
-            !self.sending,
-        )
-        .clicked()
+        if icon_button(ui, compose, Icon::Compose, "Новое сообщение · Ctrl+N", true).clicked()
         {
             self.new_conversation();
         }
@@ -1053,7 +1122,7 @@ impl MessagesApp {
             ),
             Icon::Plus,
             "Действия",
-            !self.sending,
+            true,
         );
         if plus.clicked() {
             self.prepare_contact();
@@ -1070,7 +1139,12 @@ impl MessagesApp {
                 ui.separator();
                 self.contact_menu(ui);
             });
-        if crate::composer::edit(ui, &mut self.draft, input, !self.sending)
+        if self.focus_draft {
+            ui.ctx()
+                .memory_mut(|memory| memory.request_focus(Id::unique("draft")));
+            self.focus_draft = false;
+        }
+        if crate::composer::edit(ui, &mut self.draft, input, true)
             .response
             .changed()
         {
@@ -1101,7 +1175,7 @@ impl MessagesApp {
             ),
             Icon::Smile,
             "Эмодзи",
-            !self.sending,
+            true,
         );
         Popup::menu(&emoji)
             .close_behavior(PopupCloseBehavior::CloseOnClickOutside)
@@ -1233,7 +1307,7 @@ impl MessagesApp {
 
 impl eframe::App for MessagesApp {
     fn clear_color(&self, _: &Visuals) -> [f32; 4] {
-        [0.; 4]
+        [1.; 4]
     }
     fn logic(&mut self, ctx: &Context, _: &mut eframe::Frame) {
         self.receive(ctx);
@@ -1245,6 +1319,18 @@ impl eframe::App for MessagesApp {
 impl MessagesApp {
     fn render(&mut self, root_ui: &mut Ui) {
         let ctx = root_ui.ctx().clone();
+        if self.preferences.auto_focus
+            && !self.settings_open
+            && !Popup::is_any_open(&ctx)
+            && self.selected.is_some()
+            && ctx.input(|i| {
+                i.events
+                    .iter()
+                    .any(|event| matches!(event, eframe::egui::Event::WindowFocused(true)))
+            })
+        {
+            self.focus_draft = true;
+        }
         if ctx.memory(|m| m.has_focus(Id::unique("draft")))
             && ctx.input_mut(|i| {
                 let mut found = false;
@@ -1261,9 +1347,19 @@ impl MessagesApp {
         {
             self.error = Some(crate::media::UNAVAILABLE.into());
         }
-        if self.sending && ctx.input(|i| i.viewport().close_requested()) {
+        if self.preferences.minimize_on_close && ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
+        } else if self.sending && ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
             self.error = Some("Дождись результата отправки, затем закрой окно.".into());
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::CTRL, Key::Comma)) {
+            self.open_settings();
+        }
+        if self.settings_open && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+            self.settings_open = false;
+            self.focus_draft = true;
         }
         if ctx.input_mut(|i| i.consume_key(Modifiers::CTRL, Key::N)) {
             self.new_conversation();
@@ -1278,13 +1374,7 @@ impl MessagesApp {
             .frame(Frame::NONE)
             .show(root_ui, |ui| {
                 let bounds = ui.max_rect();
-                ui.painter().rect_filled(bounds, 13, Color32::WHITE);
-                ui.painter().rect_stroke(
-                    bounds.shrink(0.5),
-                    13,
-                    Stroke::new(1.0_f32, Color32::from_rgb(206, 206, 213)),
-                    StrokeKind::Inside,
-                );
+                ui.painter().rect_filled(bounds, 0, Color32::WHITE);
                 let measured_main_width = layout::Regions::new(bounds, 40., false).main.width();
                 let draft_width = layout::composer_text_width(measured_main_width);
                 let measured = ui.painter().layout(
@@ -1310,6 +1400,11 @@ impl MessagesApp {
                     .cloned();
                 let regions = layout::Regions::new(bounds, input_height, shown_error.is_some());
                 self.sidebar(ui, regions.sidebar);
+                if self.settings_open {
+                    self.settings_panel(ui, regions.main);
+                    resize_edges(ui, bounds);
+                    return;
+                }
                 self.header(ui, regions.header);
                 let (opacity, active) = self.motion.dialogue_opacity();
                 ui.scope(|ui| {
@@ -1333,8 +1428,11 @@ impl MessagesApp {
                 self.composer(ui, regions.composer);
                 resize_edges(ui, bounds);
             });
-        if enter {
+        if enter && !self.settings_open {
             self.send();
+        }
+        if self.focus_draft {
+            ctx.request_repaint();
         }
         // No constant render loop: only input, worker events, and native text-caret blinking repaint.
         ctx.request_repaint_after(Duration::from_secs(12));
@@ -1342,9 +1440,130 @@ impl MessagesApp {
 }
 impl Drop for MessagesApp {
     fn drop(&mut self) {
+        if !self.preview && self.preferences.save_drafts {
+            let mut messages = self.drafts.clone();
+            if let Some(phone) = &self.selected {
+                messages.insert(phone.clone(), self.draft.clone());
+            } else if self.new_mode {
+                messages.insert(String::new(), self.draft.clone());
+            }
+            messages.retain(|_, text| !text.is_empty());
+            let saved = crate::settings::Drafts {
+                messages,
+                selected: self.selected.clone(),
+                new_mode: self.new_mode,
+                recipient: self.recipient.clone(),
+                uncertain_submission: self.sending,
+            };
+            let _ = saved.save(&model::data_dir().join("drafts.bin"));
+        }
         if let Some(commands) = &self.commands {
             let _ = commands.send(Command::Stop);
         }
+    }
+}
+
+impl MessagesApp {
+    fn open_settings(&mut self) {
+        self.settings_draft = self.preferences.clone();
+        self.settings_open = true;
+        self.focus_draft = false;
+    }
+    fn apply_settings(&mut self, ctx: &Context) -> bool {
+        self.settings_draft.normalize();
+        if !self.preview {
+            if let Err(error) = self
+                .settings_draft
+                .save(&model::data_dir().join("settings.bin"))
+            {
+                self.settings_status = format!("Не удалось сохранить настройки: {error}");
+                return false;
+            }
+            if !self.settings_draft.save_drafts {
+                let path = model::data_dir().join("drafts.bin");
+                if path.exists()
+                    && let Err(error) = fs::remove_file(path)
+                {
+                    self.settings_status =
+                        format!("Не удалось удалить сохранённые черновики: {error}");
+                    return false;
+                }
+            }
+        }
+        self.preferences = self.settings_draft.clone();
+        if let Ok(mut shared) = self.shared_preferences.lock() {
+            *shared = self.preferences.clone();
+        }
+        self.motion.enabled = crate::motion::Motion::new().enabled && self.preferences.animations;
+        ctx.style_mut_of(Theme::Light, |style| {
+            style.animation_time = if self.motion.enabled {
+                crate::motion::POPUP_TIME
+            } else {
+                0.
+            }
+        });
+        self.settings_status = "Настройки сохранены".into();
+        if let Some(commands) = &self.commands {
+            let _ = commands.send(Command::Refresh);
+        }
+        true
+    }
+    fn settings_panel(&mut self, ui: &mut Ui, rect: Rect) {
+        drag_area(
+            ui,
+            Rect::from_min_size(rect.min, vec2(rect.width(), 42.)),
+            "settings_drag",
+        );
+        ui.scope_builder(UiBuilder::new().max_rect(rect.shrink2(vec2(28.,20.))).layout(Layout::top_down(Align::Min)),|ui|{
+            ui.heading(RichText::new("Настройки").family(FontFamily::Name("Semibold".into())).size(23.));
+            ui.add_space(12.);
+            let available=(ui.available_height()-105.).max(150.);
+            ScrollArea::vertical().max_height(available).show(ui,|ui|{
+                ui.set_max_width(610.);
+                ui.spacing_mut().item_spacing.y=9.;
+                ui.label(RichText::new("Поведение").strong());
+                ui.checkbox(&mut self.settings_draft.auto_focus,"Сразу печатать при возврате в приложение");
+                ui.checkbox(&mut self.settings_draft.animations,"Плавные анимации");
+                ui.checkbox(&mut self.settings_draft.minimize_on_close,"Сворачивать при закрытии окна");
+                ui.small("Для полного выхода отключи сворачивание и закрой окно.");
+                ui.add_space(9.);ui.separator();ui.add_space(9.);
+                ui.label(RichText::new("Уведомления").strong());
+                ui.checkbox(&mut self.settings_draft.notifications,"Показывать новые сообщения в Windows");
+                ui.add_enabled_ui(self.settings_draft.notifications,|ui|{ui.checkbox(&mut self.settings_draft.notification_sound,"Звук уведомлений");});
+                ui.horizontal(|ui|{ui.label("Проверять сообщения каждые");ui.add(DragValue::new(&mut self.settings_draft.poll_seconds).range(2..=60).suffix(" с"));});
+                ui.add_space(9.);ui.separator();ui.add_space(9.);
+                ui.label(RichText::new("История и черновики").strong());
+                ui.checkbox(&mut self.settings_draft.save_history,"Сохранять сообщения на этом компьютере");
+                ui.checkbox(&mut self.settings_draft.sync_history_on_connect,"Загружать доступные старые сообщения при подключении");
+                ui.checkbox(&mut self.settings_draft.save_drafts,"Восстанавливать черновики после перезапуска");
+                ui.small("Данные зашифрованы для твоей учётной записи Windows. Отключение истории останавливает запись; сохранённый архив остаётся.");
+                ui.add_space(9.);ui.separator();ui.add_space(9.);
+                ui.label(RichText::new("Подключение к iPhone").strong());
+                ui.label("Способ отправки: автоматически на iPhone");
+                ui.small("Bluetooth не предоставляет подтверждённого выбора iMessage / SMS. Фотографии и полный архив переписки в текущем канале недоступны.");
+                ui.small(format!("Сохранено сообщений: {}",self.messages.len()));
+                if ui.button("Обновить доступные сообщения").clicked() && let Some(commands)=&self.commands{let _=commands.send(Command::SyncHistory);}
+                ui.add_space(15.);
+                ui.small(format!("meMessage {}",env!("CARGO_PKG_VERSION")));
+            });
+                ui.horizontal(|ui|{
+                    ui.label(RichText::new("Сделано by").size(12.).color(SECONDARY));
+                    let response=ui.allocate_response(vec2(57.,25.),Sense::click()).on_hover_cursor(CursorIcon::PointingHand).on_hover_text("Открыть maark.ru");
+                    response.widget_info(||WidgetInfo::labeled(Role::Link,true,"MAARK"));
+                    let t=ui.ctx().animate_bool_with_time(response.id.with("hover"),response.hovered(),if self.motion.enabled{0.16}else{0.});
+                    let color=Color32::from_rgb((7.+65.*t) as u8,(131.-37.*t) as u8,255);
+                    let center=response.rect.center()-vec2(0.,1.5*t);
+                    ui.painter().text(center,Align2::CENTER_CENTER,"MAARK",FontId::new(12.5,FontFamily::Name("Semibold".into())),color);
+                    if t>0.001{ui.painter().line_segment([pos2(center.x-22.*t,response.rect.bottom()-3.),pos2(center.x+22.*t,response.rect.bottom()-3.)],Stroke::new(1.,color.linear_multiply(t)));}
+                    if response.clicked(){ui.ctx().open_url(OpenUrl::new_tab("https://maark.ru"));}
+                });
+            ui.add_space(6.);
+            ui.horizontal(|ui|{
+                if ui.button("Сохранить").clicked(){self.apply_settings(ui.ctx());}
+                if ui.button("Вернуться к сообщениям").clicked(){self.settings_open=false;self.focus_draft=true;}
+            });
+            if !self.settings_status.is_empty(){ui.small(&self.settings_status);}
+        });
     }
 }
 
@@ -1625,6 +1844,7 @@ mod scenario_tests {
         time: f64,
         size: Vec2,
         bubbles: Vec<Rect>,
+        opened_urls: Vec<String>,
     }
     impl Harness {
         fn new(size: Vec2) -> Self {
@@ -1639,6 +1859,7 @@ mod scenario_tests {
                 time: 0.,
                 size,
                 bubbles: Vec::new(),
+                opened_urls: Vec::new(),
             };
             harness.frame(vec![]);
             harness.frame(vec![]);
@@ -1657,6 +1878,11 @@ mod scenario_tests {
                 |ui| self.app.render(ui),
             );
             self.labels.clear();
+            for command in &output.platform_output.commands {
+                if let OutputCommand::OpenUrl(url) = command {
+                    self.opened_urls.push(url.url.clone());
+                }
+            }
             self.bubbles = output
                 .shapes
                 .iter()
@@ -1904,5 +2130,133 @@ mod scenario_tests {
                 );
             }
         }
+    }
+    #[test]
+    fn send_keeps_the_editor_ready_for_a_second_draft_and_ack_does_not_erase_it() {
+        let mut h = Harness::new(vec2(1120., 760.));
+        let (commands, rx) = std::sync::mpsc::channel();
+        let (events, ui_events) = std::sync::mpsc::channel();
+        h.app.preview = false;
+        h.app.commands = Some(commands);
+        h.app.events = Some(ui_events);
+        h.app.draft = "Первое сообщение".into();
+        h.frame(vec![]);
+        h.click("Отправить · Enter (Shift+Enter — новая строка)");
+        let phone = match rx.try_recv().unwrap() {
+            Command::Send { phone, text, .. } => {
+                assert_eq!(text, "Первое сообщение");
+                phone
+            }
+            _ => panic!("Expected send"),
+        };
+        let ready =
+            h.ctx.memory(|memory| memory.has_focus(Id::unique("draft"))) && h.app.draft.is_empty();
+        h.frame(vec![Input::Text("Второе сообщение".into())]);
+        events.send(Event::Sent(phone)).unwrap();
+        h.frame(vec![]);
+        let next = h.app.draft.clone();
+        h.app.preview = true;
+        assert!(
+            ready,
+            "The composer must remain focused and clear the submitted text immediately"
+        );
+        assert_eq!(
+            next, "Второе сообщение",
+            "Acknowledgement must preserve the new draft"
+        );
+    }
+    #[test]
+    fn returning_to_the_application_focuses_the_composer() {
+        let mut h = Harness::new(vec2(830., 570.));
+        h.ctx
+            .memory_mut(|memory| memory.surrender_focus(Id::unique("draft")));
+        h.frame(vec![Input::WindowFocused(false)]);
+        h.frame(vec![Input::WindowFocused(true)]);
+        assert!(h.ctx.memory(|memory| memory.has_focus(Id::unique("draft"))));
+        h.frame(vec![Input::Text("Сразу после Alt+Tab".into())]);
+        assert_eq!(h.app.draft, "Сразу после Alt+Tab");
+    }
+    #[test]
+    fn failed_acknowledgement_preserves_the_next_draft_and_never_retries() {
+        let mut h = Harness::new(vec2(830., 570.));
+        let (commands, rx) = std::sync::mpsc::channel();
+        let (events, ui_events) = std::sync::mpsc::channel();
+        h.app.preview = false;
+        h.app.commands = Some(commands);
+        h.app.events = Some(ui_events);
+        h.app.draft = "Первое".into();
+        h.app.send();
+        assert!(matches!(rx.try_recv(), Ok(Command::Send { .. })));
+        h.frame(vec![]);
+        h.frame(vec![Input::Text("Следующее".into())]);
+        events
+            .send(Event::SendFailed("Проверь на телефоне".into()))
+            .unwrap();
+        h.frame(vec![]);
+        h.app.preview = true;
+        assert_eq!(h.app.draft, "Следующее");
+        assert!(!h.app.sending);
+        assert!(h.app.error.is_some());
+        assert!(rx.try_recv().is_err());
+    }
+    #[test]
+    fn settings_apply_cancel_and_activation_obey_the_focus_preference() {
+        for size in [vec2(830., 570.), vec2(1120., 760.)] {
+            let mut h = Harness::new(size);
+            h.key(Key::Comma, Modifiers::CTRL);
+            assert!(h.app.settings_open);
+            assert!(h.labels.contains_key("Сохранить"));
+            let button = h.labels["Сохранить"];
+            assert!(
+                Rect::from_min_size(Pos2::ZERO, size).contains_rect(button),
+                "Settings actions must fit at minimum size"
+            );
+            h.click("Сразу печатать при возврате в приложение");
+            h.click("Плавные анимации");
+            h.click("Сохранить");
+            assert!(!h.app.preferences.auto_focus);
+            assert!(!h.app.motion.enabled);
+            assert!(!h.app.shared_preferences.lock().unwrap().auto_focus);
+            h.key(Key::Escape, Modifiers::NONE);
+            assert!(!h.app.settings_open);
+            h.ctx.memory_mut(|m| m.surrender_focus(Id::unique("draft")));
+            h.frame(vec![Input::WindowFocused(true)]);
+            assert!(!h.ctx.memory(|m| m.has_focus(Id::unique("draft"))));
+            h.key(Key::Comma, Modifiers::CTRL);
+            h.click("Сразу печатать при возврате в приложение");
+            h.key(Key::Escape, Modifiers::NONE);
+            assert!(
+                !h.app.preferences.auto_focus,
+                "Escape must discard unapplied changes"
+            );
+        }
+    }
+    #[test]
+    fn maker_credit_opens_only_the_requested_site() {
+        for size in [vec2(830., 570.), vec2(1120., 760.)] {
+            let mut h = Harness::new(size);
+            h.key(Key::Comma, Modifiers::CTRL);
+            let bounds = h.labels["MAARK"];
+            assert!(Rect::from_min_size(Pos2::ZERO, size).contains_rect(bounds));
+            h.click("MAARK");
+            assert_eq!(h.opened_urls, vec!["https://maark.ru"]);
+        }
+    }
+    #[test]
+    fn initial_snapshot_preserves_storage_errors_and_does_not_focus_behind_settings() {
+        let mut h = Harness::new(vec2(830., 570.));
+        let (events, receiver) = std::sync::mpsc::channel();
+        h.app.events = Some(receiver);
+        let messages = h.app.messages.clone();
+        h.app.selected = None;
+        h.app.draft.clear();
+        h.app.open_settings();
+        events
+            .send(Event::StorageError("Архив сохранён, но не открыт".into()))
+            .unwrap();
+        events.send(Event::Snapshot(messages)).unwrap();
+        h.frame(vec![]);
+        assert_eq!(h.app.error.as_deref(), Some("Архив сохранён, но не открыт"));
+        assert!(!h.app.focus_draft);
     }
 }

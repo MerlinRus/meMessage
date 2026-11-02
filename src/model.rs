@@ -15,7 +15,7 @@ pub enum SendState {
     Accepted,
     Unconfirmed,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
     pub id: String,
     pub handle: String,
@@ -108,14 +108,49 @@ pub fn time_label(timestamp: i64) -> String {
         time.format("%d.%m").to_string()
     }
 }
-pub fn data_path() -> PathBuf {
+pub fn app_root() -> PathBuf {
     let exe = std::env::current_exe().unwrap_or_default();
     let folder = exe.parent().unwrap_or(Path::new("."));
     let root = folder
         .ancestors()
         .find(|p| p.join("Cargo.toml").exists())
         .unwrap_or(folder);
-    root.join("data").join("history.rust.bin")
+    root.to_path_buf()
+}
+pub fn data_dir() -> PathBuf {
+    if app_root().join("portable.flag").exists() {
+        return app_root().join("data");
+    }
+    std::env::var_os("LOCALAPPDATA")
+        .map(|base| PathBuf::from(base).join("meMessage"))
+        .unwrap_or_else(|| app_root().join("data"))
+}
+pub fn data_path() -> PathBuf {
+    data_dir().join("history.rust.bin")
+}
+pub fn diagnostics_dir() -> PathBuf {
+    let path = data_dir().join("diagnostics");
+    let _ = fs::create_dir_all(&path);
+    path
+}
+pub fn migrate_legacy() -> io::Result<usize> {
+    migrate_from(&app_root().join("data"), &data_dir())
+}
+fn migrate_from(old: &Path, new: &Path) -> io::Result<usize> {
+    if old == new {
+        return Ok(0);
+    }
+    let mut copied = 0;
+    for name in ["history.rust.bin", "contacts.rust.bin"] {
+        let source = old.join(name);
+        let target = new.join(name);
+        if source.exists() && !target.exists() {
+            fs::create_dir_all(new)?;
+            fs::copy(source, target)?;
+            copied += 1;
+        }
+    }
+    Ok(copied)
 }
 pub(crate) fn protect(data: &[u8], encrypt: bool) -> io::Result<Vec<u8>> {
     let input = CRYPT_INTEGER_BLOB {
@@ -178,7 +213,6 @@ pub fn load(path: &Path) -> io::Result<Vec<Message>> {
 pub fn save(path: &Path, messages: &[Message]) -> io::Result<()> {
     let mut records = messages.to_vec();
     records.sort_by_key(|m| std::cmp::Reverse(m.timestamp));
-    records.truncate(2000);
     let bytes = protect(&serde_json::to_vec(&records)?, true)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -235,5 +269,45 @@ mod tests {
         assert_eq!(loaded[0].text, "Привет 👋");
         assert_eq!(loaded[0].state, SendState::Unconfirmed);
         fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn history_preserves_more_than_two_thousand_records_and_migration_never_overwrites() {
+        let root = std::env::temp_dir().join(format!("meMessage-migration-{}", std::process::id()));
+        let old = root.join("old");
+        let new = root.join("new");
+        fs::create_dir_all(&old).unwrap();
+        fs::create_dir_all(&new).unwrap();
+        fs::write(old.join("contacts.rust.bin"), b"original").unwrap();
+        fs::write(new.join("contacts.rust.bin"), b"newer").unwrap();
+        let records: Vec<_> = (0..2100)
+            .map(|i| Message {
+                id: i.to_string(),
+                handle: String::new(),
+                phone: "+79990000000".into(),
+                name: String::new(),
+                text: "History".into(),
+                timestamp: i,
+                outgoing: false,
+                read: true,
+                state: SendState::Received,
+            })
+            .collect();
+        save(&old.join("history.rust.bin"), &records).unwrap();
+        assert_eq!(migrate_from(&old, &new).unwrap(), 1);
+        assert_eq!(fs::read(new.join("contacts.rust.bin")).unwrap(), b"newer");
+        assert!(old.join("history.rust.bin").exists());
+        assert_eq!(load(&new.join("history.rust.bin")).unwrap().len(), 2100);
+        assert_eq!(migrate_from(&old, &new).unwrap(), 0);
+        for path in [
+            old.join("history.rust.bin"),
+            old.join("contacts.rust.bin"),
+            new.join("history.rust.bin"),
+            new.join("contacts.rust.bin"),
+        ] {
+            fs::remove_file(path).unwrap();
+        }
+        fs::remove_dir(old).unwrap();
+        fs::remove_dir(new).unwrap();
+        fs::remove_dir(root).unwrap();
     }
 }

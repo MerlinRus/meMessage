@@ -124,6 +124,9 @@ impl<T: Exchange> MapClient<T> {
         Err(io::Error::other("Too many OBEX fragments"))
     }
     pub fn list(&mut self, folder: &str) -> io::Result<String> {
+        self.list_page(folder, 0, 100)
+    }
+    pub fn list_page(&mut self, folder: &str, offset: u16, count: u16) -> io::Result<String> {
         if !["inbox", "sent"].contains(&folder) {
             return Err(io::Error::other("Unsupported folder"));
         }
@@ -131,7 +134,19 @@ impl<T: Exchange> MapClient<T> {
             self.connection.clone(),
             name(folder),
             kind("x-bt/MAP-msg-listing"),
-            header(0x4c, &[1, 2, 0, 100]),
+            header(
+                0x4c,
+                &[
+                    1,
+                    2,
+                    (count >> 8) as u8,
+                    count as u8,
+                    2,
+                    2,
+                    (offset >> 8) as u8,
+                    offset as u8,
+                ],
+            ),
         ]
         .concat();
         String::from_utf8(self.get(request)?).map_err(io::Error::other)

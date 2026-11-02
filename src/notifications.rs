@@ -98,8 +98,24 @@ impl Notifications {
         text: &str,
         click: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> Result<(), String> {
+        self.show_with_sound(title, text, click, true)
+    }
+    pub fn show_with_sound(
+        &mut self,
+        title: &str,
+        text: &str,
+        click: Option<Arc<dyn Fn() + Send + Sync>>,
+        sound: bool,
+    ) -> Result<(), String> {
         self.ensure_enabled()?;
-        let xml = toast_xml(title, text);
+        let xml = if sound {
+            toast_xml(title, text)
+        } else {
+            toast_xml(title, text).replace(
+                r#"<audio src="ms-winsoundevent:Notification.IM"/>"#,
+                r#"<audio silent="true"/>"#,
+            )
+        };
         let document = XmlDocument::new().map_err(|e| e.to_string())?;
         document
             .LoadXml(&HSTRING::from(xml))
@@ -137,12 +153,7 @@ fn register_shortcut() -> Result<(), String> {
         let folder_text = folder.to_string();
         CoTaskMemFree(Some(folder.0.cast()));
         let path = PathBuf::from(folder_text.map_err(|e| e.to_string())?).join("iPhone Bridge.lnk");
-        let root = model::data_path()
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .to_path_buf();
+        let root = model::app_root();
         let executable = HSTRING::from(root.join("iMessage.exe").as_os_str());
         let link: IShellLinkW =
             CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).map_err(|e| e.to_string())?;
@@ -252,12 +263,11 @@ fn repair_pinned_shortcuts(root: &std::path::Path) -> Result<usize, String> {
     Ok(repaired)
 }
 fn icon_path() -> Result<PathBuf, String> {
-    let root = model::data_path()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("assets");
+    let installed = model::app_root().join("assets/app-icon.png");
+    if installed.exists() {
+        return Ok(installed);
+    }
+    let root = model::data_dir().join("icons");
     std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
     let path = root.join("app-icon.png");
     if !path.exists() {

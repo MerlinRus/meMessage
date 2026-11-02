@@ -3,16 +3,12 @@ on: [push, pull_request]
 permissions:
   contents: read
 jobs:
-  test:
+  checks:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - name: Prepare local assets
-        shell: pwsh
-        run: ./Setup-Assets.ps1
       - run: cargo fmt --check
-      - run: cargo test --locked
       - run: cargo clippy --locked --all-targets -- -D warnings

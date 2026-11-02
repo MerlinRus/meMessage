@@ -1,0 +1,11 @@
+/target/
+/data/
+/build/
+/.codegraph/
+/legacy/
+/assets/fonts/
+/assets/emoji/apple-32.png
+*.exe
+*.pdb
+*.tmp
+*.part

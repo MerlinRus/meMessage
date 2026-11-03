@@ -23,7 +23,8 @@ indicators, online presence or unsupported group behavior. Do not infer gender.
 
 ## Local data
 
-History and contact names are protected with Windows DPAPI under data/. Live
+History, contact names/photos, settings and drafts are protected with Windows DPAPI
+under %LOCALAPPDATA%/meMessage, or data/ when portable.flag exists. Live
 messages are never replaced with preview data. Preview uses synthetic conversations
 and cannot send or access Bluetooth. Data, local builds, diagnostics and external
 font/art assets are excluded from the public repository.

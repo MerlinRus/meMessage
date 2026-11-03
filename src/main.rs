@@ -1,8 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+mod avatars;
 mod capabilities;
 mod composer;
 mod contacts;
 mod emoji;
+mod icons;
 mod layout;
 mod map;
 mod media;

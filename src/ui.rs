@@ -26,16 +26,11 @@ const TEXT: Color32 = Color32::from_rgb(29, 29, 31);
 const SECONDARY: Color32 = Color32::from_rgb(116, 116, 122);
 const SIDE: Color32 = Color32::from_rgb(246, 246, 248);
 
-#[derive(Clone, Copy)]
-enum Icon {
-    Compose,
-    Filter,
-    Video,
-    Plus,
-    Smile,
-    Arrow,
-    Chevron,
-    Search,
+use crate::icons::{Icon, paint as paint_icon};
+
+struct PhotoResult {
+    phone: String,
+    result: Result<Option<Vec<u8>>, String>,
 }
 
 pub struct MessagesApp {
@@ -76,10 +71,14 @@ pub struct MessagesApp {
     settings_open: bool,
     settings_draft: crate::settings::Settings,
     settings_status: String,
+    photo_events: Option<Receiver<PhotoResult>>,
+    photo_loading: bool,
+    photo_textures: HashMap<String, TextureHandle>,
 }
 
 pub fn setup(ctx: &Context) {
     ctx.set_theme(Theme::Light);
+    egui_extras::install_image_loaders(ctx);
     let mut fonts = FontDefinitions::default();
     let font_root = model::app_root().join("assets/fonts");
     for (name, path) in [
@@ -113,6 +112,10 @@ pub fn setup(ctx: &Context) {
     fonts
         .families
         .insert(FontFamily::Name("Semibold".into()), semibold);
+    fonts.families.insert(
+        FontFamily::Monospace,
+        fonts.families[&FontFamily::Proportional].clone(),
+    );
     ctx.set_fonts(fonts);
     let mut style = (*ctx.style_of(Theme::Light)).clone();
     style.visuals = Visuals::light();
@@ -129,6 +132,17 @@ pub fn setup(ctx: &Context) {
     style
         .text_styles
         .insert(TextStyle::Button, FontId::proportional(13.));
+    style.text_styles.insert(
+        TextStyle::Heading,
+        FontId::new(22., FontFamily::Name("Semibold".into())),
+    );
+    style
+        .text_styles
+        .insert(TextStyle::Small, FontId::proportional(11.));
+    style.text_styles.insert(
+        TextStyle::Monospace,
+        FontId::proportional(layout::BODY_SIZE),
+    );
     ctx.set_style_of(Theme::Light, style);
 }
 
@@ -242,6 +256,9 @@ impl MessagesApp {
             shared_preferences,
             settings_open: false,
             settings_status,
+            photo_events: None,
+            photo_loading: false,
+            photo_textures: HashMap::new(),
         };
         if preview {
             app.seed_preview();
@@ -270,6 +287,20 @@ impl MessagesApp {
         app
     }
     fn receive(&mut self, ctx: &Context) {
+        if let Some(result) = self.photo_events.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.photo_events = None;
+            self.photo_loading = false;
+            match result.result {
+                Ok(Some(bytes)) => {
+                    self.set_photo(&result.phone, Some(bytes));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    self.contacts_status = error.clone();
+                    self.error = Some(error);
+                }
+            }
+        }
         let events: Vec<Event> = self
             .events
             .as_ref()
@@ -329,6 +360,7 @@ impl MessagesApp {
                     self.notification_error = Some(error);
                 }
                 Event::Contacts(book) => {
+                    self.photo_textures.clear();
                     self.contacts = self
                         .shared_contacts
                         .lock()
@@ -367,6 +399,80 @@ impl MessagesApp {
                 .ok()
                 .map(|phone| model::key(&phone))
         })
+    }
+    fn avatar(&mut self, ui: &Ui, phone: &str, center: Pos2, radius: f32) {
+        let phone = model::key(phone);
+        if !self.photo_textures.contains_key(&phone)
+            && let Some(bytes) = self.contacts.photos.get(&phone)
+            && let Some(texture) = crate::avatars::texture(ui.ctx(), bytes)
+        {
+            self.photo_textures.insert(phone.clone(), texture);
+        }
+        if let Some(texture) = self.photo_textures.get(&phone) {
+            crate::avatars::paint(ui.painter(), texture, center, radius);
+        } else {
+            ui.painter()
+                .circle_filled(center, radius, Color32::from_rgb(199, 199, 206));
+            paint_icon(
+                ui,
+                Rect::from_center_size(center, vec2(radius * 1.65, radius * 1.65)),
+                Icon::Person,
+                Color32::from_rgb(249, 249, 251),
+            );
+        }
+    }
+    fn set_photo(&mut self, phone: &str, photo: Option<Vec<u8>>) -> bool {
+        let result = (|| -> std::io::Result<Book> {
+            let mut shared = self
+                .shared_contacts
+                .lock()
+                .map_err(|_| std::io::Error::other("Контакты заняты."))?;
+            let mut updated = shared.clone();
+            let phone = model::key(phone);
+            if let Some(bytes) = photo {
+                updated.photos.insert(phone, bytes);
+            } else {
+                updated.photos.remove(&phone);
+            }
+            if !self.preview {
+                updated.save(&contacts::path())?;
+            }
+            *shared = updated.clone();
+            Ok(updated)
+        })();
+        match result {
+            Ok(book) => {
+                self.contacts = book;
+                self.photo_textures.remove(&model::key(phone));
+                self.contacts_status = "Фото контакта сохранено на ноутбуке.".into();
+                true
+            }
+            Err(error) => {
+                self.contacts_status = format!("Фото не сохранено: {error}");
+                false
+            }
+        }
+    }
+    fn choose_photo(&mut self, phone: &str, ctx: &Context) {
+        if self.photo_loading {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.photo_events = Some(rx);
+        self.photo_loading = true;
+        self.contacts_status = "Выбери фото. Оно сохранится только на ноутбуке.".into();
+        let phone = model::key(phone);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = rfd::FileDialog::new()
+                .set_title("Фото контакта")
+                .add_filter("Фотографии", &["jpg", "jpeg", "png", "webp"])
+                .pick_file()
+                .map(|path| crate::avatars::from_file(&path).map_err(|error| error.to_string()))
+                .transpose();
+            let _ = tx.send(PhotoResult { phone, result });
+            ctx.request_repaint();
+        });
     }
     fn prepare_contact(&mut self) {
         self.contact_name = self
@@ -417,7 +523,35 @@ impl MessagesApp {
                     .small()
                     .color(SECONDARY),
             );
-            ui.separator();
+            ui.add_space(8.);
+            ui.horizontal(|ui| {
+                let (rect, _) = ui.allocate_exact_size(vec2(44., 44.), Sense::hover());
+                self.avatar(ui, &phone, rect.center(), 22.);
+                if ui
+                    .add_enabled(
+                        !self.photo_loading,
+                        Button::image_and_text(
+                            Image::from_bytes(Icon::Photo.source().0, Icon::Photo.source().1)
+                                .fit_to_exact_size(vec2(14., 14.))
+                                .tint(TEXT),
+                            if self.contacts.photos.contains_key(&model::key(&phone)) {
+                                "Изменить фото"
+                            } else {
+                                "Добавить фото"
+                            },
+                        ),
+                    )
+                    .clicked()
+                {
+                    self.choose_photo(&phone, ui.ctx());
+                }
+                if self.contacts.photos.contains_key(&model::key(&phone))
+                    && ui.button("Убрать фото").clicked()
+                {
+                    self.set_photo(&phone, None);
+                }
+            });
+            ui.add_space(10.);
             ui.label("Имя контакта");
             ui.add(
                 TextEdit::singleline(&mut self.contact_name)
@@ -575,27 +709,16 @@ impl MessagesApp {
             response.widget_info(|| WidgetInfo::labeled(Role::Button, true, label));
             ui.painter().circle_filled(center, 6., color);
             if response.hovered() {
-                let stroke = Stroke::new(1.0_f32, Color32::from_black_alpha(150));
-                match i {
-                    0 => {
-                        ui.painter()
-                            .line_segment([center + vec2(-2., -2.), center + vec2(2., 2.)], stroke);
-                        ui.painter()
-                            .line_segment([center + vec2(2., -2.), center + vec2(-2., 2.)], stroke);
-                    }
-                    1 => {
-                        ui.painter()
-                            .line_segment([center + vec2(-3., 0.), center + vec2(3., 0.)], stroke);
-                    }
-                    _ => {
-                        ui.painter().rect_stroke(
-                            Rect::from_center_size(center, vec2(5., 5.)),
-                            0,
-                            stroke,
-                            StrokeKind::Inside,
-                        );
-                    }
-                }
+                paint_icon(
+                    ui,
+                    Rect::from_center_size(center, vec2(7., 7.)),
+                    match i {
+                        0 => Icon::Close,
+                        1 => Icon::Minimize,
+                        _ => Icon::Maximize,
+                    },
+                    Color32::from_black_alpha(150),
+                );
             }
             if response.clicked() {
                 match i {
@@ -645,7 +768,7 @@ impl MessagesApp {
         ui.painter()
             .rect_filled(search, 15, Color32::from_rgb(234, 234, 237));
         paint_icon(
-            ui.painter(),
+            ui,
             Rect::from_center_size(pos2(search.left() + 16., search.center().y), vec2(13., 13.)),
             Icon::Search,
             SECONDARY,
@@ -715,7 +838,12 @@ impl MessagesApp {
                                     },
                                 );
                             }
-                            avatar(ui.painter(), pos2(row.left() + 30., row.center().y), 21.);
+                            self.avatar(
+                                ui,
+                                &conversation.phone,
+                                pos2(row.left() + 30., row.center().y),
+                                21.,
+                            );
                             let foreground = if selected { Color32::WHITE } else { TEXT };
                             let secondary = if selected {
                                 Color32::from_rgb(235, 245, 255)
@@ -781,12 +909,13 @@ impl MessagesApp {
                     });
             },
         );
-        let settings_button = ui
-            .put(
-                Rect::from_min_size(pos2(rect.left() + 9., rect.bottom() - 31.), vec2(30., 26.)),
-                Button::new("⚙").frame(false),
-            )
-            .on_hover_text("Настройки · Ctrl+,");
+        let settings_button = icon_button(
+            ui,
+            Rect::from_min_size(pos2(rect.left() + 9., rect.bottom() - 31.), vec2(30., 26.)),
+            Icon::Settings,
+            "Настройки · Ctrl+,",
+            true,
+        );
         if settings_button.clicked() {
             self.open_settings();
         }
@@ -864,13 +993,14 @@ impl MessagesApp {
         } else {
             let name = self.name();
             let center = pos2(rect.center().x, rect.top() + 24.);
-            avatar(ui.painter(), center, 15.5);
+            let phone = self.selected.clone().unwrap_or_default();
+            self.avatar(ui, &phone, center, 15.5);
             let galley = ui.painter().layout_no_wrap(
-                name,
+                name.clone(),
                 FontId::new(11., FontFamily::Name("Semibold".into())),
                 TEXT,
             );
-            let width = (galley.size().x + 29.).min(rect.width() - 150.);
+            let width = (galley.size().x + 36.).min(rect.width() - 150.);
             let capsule =
                 Rect::from_center_size(pos2(center.x, rect.top() + 56.), vec2(width, 23.));
             ui.painter()
@@ -882,11 +1012,17 @@ impl MessagesApp {
             );
             response
                 .widget_info(|| WidgetInfo::labeled(Role::Button, true, "Сведения о собеседнике"));
-            ui.painter()
-                .with_clip_rect(capsule.shrink2(vec2(10., 1.)))
-                .galley(pos2(capsule.left() + 10., capsule.top() + 4.), galley, TEXT);
-            paint_icon(
+            text_limit(
                 ui.painter(),
+                &name,
+                pos2(capsule.left() + 10., capsule.top() + 4.),
+                (capsule.width() - 32.).max(1.),
+                1,
+                FontId::new(11., FontFamily::Name("Semibold".into())),
+                TEXT,
+            );
+            paint_icon(
+                ui,
                 Rect::from_center_size(
                     pos2(capsule.right() - 9., capsule.center().y),
                     vec2(5., 8.),
@@ -912,15 +1048,11 @@ impl MessagesApp {
         if records.is_empty() {
             let center = rect.center() - vec2(0., 15.);
             let p = ui.painter();
-            p.rect_stroke(
-                Rect::from_center_size(center - vec2(0., 36.), vec2(52., 39.)),
-                15,
-                Stroke::new(2.0_f32, Color32::from_rgb(207, 207, 214)),
-                StrokeKind::Inside,
-            );
-            p.line_segment(
-                [center + vec2(-12., -17.), center + vec2(-18., -7.)],
-                Stroke::new(2.0_f32, Color32::from_rgb(207, 207, 214)),
+            paint_icon(
+                ui,
+                Rect::from_center_size(center - vec2(0., 32.), vec2(52., 48.)),
+                Icon::Message,
+                Color32::from_rgb(207, 207, 214),
             );
             p.text(
                 center + vec2(0., 12.),
@@ -1562,7 +1694,7 @@ impl MessagesApp {
                 if ui.button("Сохранить").clicked(){self.apply_settings(ui.ctx());}
                 if ui.button("Вернуться к сообщениям").clicked(){self.settings_open=false;self.focus_draft=true;}
             });
-            if !self.settings_status.is_empty(){ui.small(&self.settings_status);}
+            if !self.settings_status.is_empty(){ui.add(Label::new(RichText::new(&self.settings_status).small()).truncate()).on_hover_text(&self.settings_status);}
         });
     }
 }
@@ -1586,23 +1718,6 @@ fn text_limit(
     let galley = p.layout_job(job);
     p.galley(pos, galley, color);
 }
-fn avatar(p: &Painter, center: Pos2, radius: f32) {
-    p.circle_filled(center, radius, Color32::from_rgb(199, 199, 206));
-    p.circle_filled(
-        center + vec2(0., -radius * 0.24),
-        radius * 0.28,
-        Color32::from_rgb(249, 249, 251),
-    );
-    let body = Rect::from_center_size(
-        center + vec2(0., radius * 0.48),
-        vec2(radius * 1.24, radius * 0.69),
-    );
-    p.add(Shape::ellipse_filled(
-        body.center(),
-        body.size() / 2.,
-        Color32::from_rgb(249, 249, 251),
-    ));
-}
 fn icon_button(ui: &mut Ui, rect: Rect, icon: Icon, label: &str, enabled: bool) -> Response {
     let response = ui.interact(
         rect,
@@ -1614,6 +1729,14 @@ fn icon_button(ui: &mut Ui, rect: Rect, icon: Icon, label: &str, enabled: bool) 
         },
     );
     response.widget_info(|| WidgetInfo::labeled(Role::Button, enabled, label));
+    if enabled && response.has_focus() {
+        ui.painter().rect_stroke(
+            rect.expand(1.),
+            5,
+            Stroke::new(1.5, BLUE),
+            StrokeKind::Outside,
+        );
+    }
     let color = if enabled {
         Color32::from_rgb(85, 85, 93)
     } else {
@@ -1641,7 +1764,7 @@ fn icon_button(ui: &mut Ui, rect: Rect, icon: Icon, label: &str, enabled: bool) 
         );
     }
     paint_icon(
-        ui.painter(),
+        ui,
         rect.shrink(if matches!(icon, Icon::Arrow) { 7. } else { 7.5 }),
         icon,
         if matches!(icon, Icon::Arrow) {
@@ -1657,96 +1780,6 @@ fn icon_button(ui: &mut Ui, rect: Rect, icon: Icon, label: &str, enabled: bool) 
             CursorIcon::Default
         })
         .on_hover_text(label)
-}
-fn paint_icon(p: &Painter, rect: Rect, icon: Icon, color: Color32) {
-    let point = |x: f32, y: f32| {
-        pos2(
-            rect.left() + x * rect.width(),
-            rect.top() + y * rect.height(),
-        )
-    };
-    let stroke = Stroke::new(1.45_f32, color);
-    let line = |a: (f32, f32), b: (f32, f32)| {
-        p.line_segment([point(a.0, a.1), point(b.0, b.1)], stroke);
-    };
-    match icon {
-        Icon::Plus => {
-            line((0.05, 0.5), (0.95, 0.5));
-            line((0.5, 0.05), (0.5, 0.95));
-        }
-        Icon::Arrow => {
-            line((0.15, 0.44), (0.5, 0.08));
-            line((0.5, 0.08), (0.85, 0.44));
-            line((0.5, 0.08), (0.5, 0.95));
-        }
-        Icon::Chevron => {
-            line((0.1, 0.1), (0.8, 0.5));
-            line((0.8, 0.5), (0.1, 0.9));
-        }
-        Icon::Filter => {
-            line((0.05, 0.22), (0.95, 0.22));
-            line((0.2, 0.5), (0.8, 0.5));
-            line((0.36, 0.78), (0.64, 0.78));
-        }
-        Icon::Search => {
-            p.circle_stroke(point(0.4, 0.4), rect.width() * 0.34, stroke);
-            line((0.66, 0.66), (0.97, 0.97));
-        }
-        Icon::Smile => {
-            p.circle_stroke(rect.center(), rect.width() * 0.46, stroke);
-            p.circle_filled(point(0.33, 0.38), 0.8, color);
-            p.circle_filled(point(0.67, 0.38), 0.8, color);
-            p.add(Shape::line(
-                vec![
-                    point(0.27, 0.61),
-                    point(0.38, 0.72),
-                    point(0.5, 0.75),
-                    point(0.62, 0.72),
-                    point(0.73, 0.61),
-                ],
-                stroke,
-            ));
-        }
-        Icon::Video => {
-            p.rect_stroke(
-                Rect::from_min_max(point(0.03, 0.15), point(0.66, 0.85)),
-                3,
-                stroke,
-                StrokeKind::Inside,
-            );
-            p.add(Shape::closed_line(
-                vec![
-                    point(0.66, 0.37),
-                    point(0.98, 0.17),
-                    point(0.98, 0.83),
-                    point(0.66, 0.63),
-                ],
-                stroke,
-            ));
-        }
-        Icon::Compose => {
-            p.add(Shape::line(
-                vec![
-                    point(0.6, 0.15),
-                    point(0.12, 0.15),
-                    point(0.12, 0.92),
-                    point(0.88, 0.92),
-                    point(0.88, 0.47),
-                ],
-                stroke,
-            ));
-            p.add(Shape::closed_line(
-                vec![
-                    point(0.4, 0.6),
-                    point(0.45, 0.39),
-                    point(0.84, 0.02),
-                    point(0.99, 0.16),
-                    point(0.6, 0.55),
-                ],
-                stroke,
-            ));
-        }
-    }
 }
 fn drag_area(ui: &mut Ui, rect: Rect, id: &str) {
     if rect.width() < 1. {
@@ -1845,6 +1878,8 @@ mod scenario_tests {
         size: Vec2,
         bubbles: Vec<Rect>,
         opened_urls: Vec<String>,
+        draft_clip: Option<Rect>,
+        elided_texts: Vec<String>,
     }
     impl Harness {
         fn new(size: Vec2) -> Self {
@@ -1860,6 +1895,8 @@ mod scenario_tests {
                 size,
                 bubbles: Vec::new(),
                 opened_urls: Vec::new(),
+                draft_clip: None,
+                elided_texts: Vec::new(),
             };
             harness.frame(vec![]);
             harness.frame(vec![]);
@@ -1878,6 +1915,24 @@ mod scenario_tests {
                 |ui| self.app.render(ui),
             );
             self.labels.clear();
+            self.elided_texts = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    epaint::Shape::Text(text) if text.galley.elided => {
+                        Some(text.galley.job.text.clone())
+                    }
+                    _ => None,
+                })
+                .collect();
+            self.draft_clip = output.shapes.iter().find_map(|shape| match &shape.shape {
+                epaint::Shape::Text(text)
+                    if !self.app.draft.is_empty() && text.galley.job.text == self.app.draft =>
+                {
+                    Some(shape.clip_rect)
+                }
+                _ => None,
+            });
             for command in &output.platform_output.commands {
                 if let OutputCommand::OpenUrl(url) = command {
                     self.opened_urls.push(url.url.clone());
@@ -2258,5 +2313,173 @@ mod scenario_tests {
         h.frame(vec![]);
         assert_eq!(h.app.error.as_deref(), Some("Архив сохранён, но не открыт"));
         assert!(!h.app.focus_draft);
+    }
+    fn photo_fixture(color: image::Rgba<u8>) -> Vec<u8> {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(16, 16, color))
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        crate::avatars::prepare(bytes.get_ref()).unwrap()
+    }
+    #[test]
+    fn photo_changes_follow_the_chosen_contact_and_survive_worker_updates() {
+        for size in [vec2(830., 570.), vec2(1120., 760.)] {
+            let mut h = Harness::new(size);
+            let phone = h.app.selected.clone().unwrap();
+            let other = h
+                .app
+                .conversations
+                .iter()
+                .find(|c| c.phone != phone)
+                .unwrap()
+                .phone
+                .clone();
+            let first = photo_fixture(image::Rgba([20, 180, 80, 255]));
+            assert!(h.app.set_photo(&phone, Some(first.clone())));
+            h.frame(vec![]);
+            let texture = h.app.photo_textures[&phone].id();
+            h.click("Сведения о собеседнике");
+            assert!(h.labels.contains_key("Изменить фото"));
+            assert!(h.labels.contains_key("Убрать фото"));
+            let first_rect = h.labels["Изменить фото"];
+            let remove_rect = h.labels["Убрать фото"];
+            assert!(!first_rect.intersects(remove_rect));
+            h.key(Key::Escape, Modifiers::NONE);
+            h.app.select(&other);
+            let replacement = photo_fixture(image::Rgba([180, 30, 90, 255]));
+            let (tx, rx) = std::sync::mpsc::channel();
+            h.app.photo_events = Some(rx);
+            h.app.photo_loading = true;
+            tx.send(PhotoResult {
+                phone: phone.clone(),
+                result: Ok(Some(replacement.clone())),
+            })
+            .unwrap();
+            h.frame(vec![]);
+            assert_eq!(h.app.contacts.photos[&phone], replacement);
+            assert!(!h.app.contacts.photos.contains_key(&other));
+            assert_ne!(h.app.photo_textures[&phone].id(), texture);
+            let (tx, rx) = std::sync::mpsc::channel();
+            h.app.events = Some(rx);
+            tx.send(Event::Contacts(Book::default())).unwrap();
+            h.frame(vec![]);
+            assert_eq!(h.app.contacts.photos[&phone], replacement);
+            h.app.select(&phone);
+            h.frame(vec![]);
+            h.click("Сведения о собеседнике");
+            h.click("Убрать фото");
+            assert!(!h.app.contacts.photos.contains_key(&phone));
+            assert!(h.labels.contains_key("Добавить фото"));
+        }
+    }
+    #[test]
+    fn cancelled_or_bad_photo_keeps_contact_and_draft_intact() {
+        let mut h = Harness::new(vec2(830., 570.));
+        let phone = h.app.selected.clone().unwrap();
+        let photo = photo_fixture(image::Rgba([30, 80, 200, 255]));
+        h.app.set_photo(&phone, Some(photo.clone()));
+        h.app.draft = "Черновик при выборе фото".into();
+        for result in [Ok(None), Err("Фото не открылось".into())] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            h.app.photo_events = Some(rx);
+            h.app.photo_loading = true;
+            tx.send(PhotoResult {
+                phone: phone.clone(),
+                result,
+            })
+            .unwrap();
+            h.frame(vec![]);
+            assert_eq!(h.app.contacts.photos[&phone], photo);
+            assert_eq!(h.app.draft, "Черновик при выборе фото");
+            assert!(!h.app.photo_loading);
+        }
+        assert_eq!(h.app.error.as_deref(), Some("Фото не открылось"));
+    }
+    #[test]
+    fn typography_is_consistent_across_every_builtin_style() {
+        let h = Harness::new(vec2(830., 570.));
+        let style = h.ctx.style_of(Theme::Light);
+        for text_style in [
+            TextStyle::Heading,
+            TextStyle::Body,
+            TextStyle::Button,
+            TextStyle::Small,
+            TextStyle::Monospace,
+        ] {
+            let family = &style.text_styles[&text_style].family;
+            assert!(
+                *family == FontFamily::Proportional
+                    || *family == FontFamily::Name("Semibold".into())
+            );
+        }
+        assert!(
+            model::app_root()
+                .join("assets/fonts/SF-Pro-Text-Regular.otf")
+                .exists()
+        );
+        assert!(
+            model::app_root()
+                .join("assets/fonts/SF-Pro-Text-Semibold.otf")
+                .exists()
+        );
+    }
+    #[test]
+    fn worst_case_content_keeps_bubbles_and_composer_inside_the_window() {
+        for size in [vec2(830., 570.), vec2(1120., 760.), vec2(1600., 1000.)] {
+            let mut h = Harness::new(size);
+            let phone = h.app.selected.clone().unwrap();
+            h.app
+                .contacts
+                .imported
+                .insert(phone.clone(), "ОченьДлинноеИмяБезПробелов".repeat(15));
+            let mut message = h.app.messages[0].clone();
+            message.phone = phone;
+            message.text = format!(
+                "{}\n{}\n{}",
+                "W".repeat(500),
+                "Строка с переносами\n".repeat(30),
+                "👨‍👩‍👧‍👦❤️".repeat(20)
+            );
+            h.app.messages = vec![message];
+            h.app.rebuild_conversations();
+            h.app.draft = "Многострочный черновик 👋\n".repeat(40);
+            h.app.error = Some("Ошибка соединения с длинным описанием. ".repeat(20));
+            for _ in 0..3 {
+                h.frame(vec![]);
+            }
+            let regions = layout::Regions::new(Rect::from_min_size(Pos2::ZERO, size), 128., true);
+            assert!(!h.bubbles.is_empty());
+            for bubble in &h.bubbles {
+                assert!(bubble.left() >= regions.thread.left() - 1.);
+                assert!(bubble.right() <= regions.thread.right() + 1.);
+            }
+            let draft = h
+                .labels
+                .get(&h.app.draft)
+                .copied()
+                .or_else(|| h.labels.get("Сообщение").copied());
+            if let Some(draft) = draft {
+                assert!(draft.bottom() <= size.y);
+                assert!(draft.left() >= regions.main.left());
+            }
+            let clip = h.draft_clip.expect("The draft must be rendered");
+            assert!(clip.bottom() <= size.y);
+            assert!(clip.top() >= regions.composer.top());
+            h.key(Key::Comma, Modifiers::CTRL);
+            h.app.settings_status = "Ошибка с подробным описанием. ".repeat(30);
+            h.frame(vec![]);
+            assert!(Rect::from_min_size(Pos2::ZERO, size).contains_rect(h.labels["Сохранить"]));
+            assert!(Rect::from_min_size(Pos2::ZERO, size).contains_rect(h.labels["MAARK"]));
+        }
+    }
+    #[test]
+    fn short_contact_titles_fit_without_ellipsis() {
+        for size in [vec2(830., 570.), vec2(1120., 760.)] {
+            let h = Harness::new(size);
+            assert!(
+                !h.elided_texts.contains(&h.app.name()),
+                "A short contact name must fit beside the header chevron"
+            );
+        }
     }
 }

@@ -15,6 +15,8 @@ pub struct Book {
     pub imported: BTreeMap<String, String>,
     #[serde(default)]
     pub aliases: BTreeMap<String, String>,
+    #[serde(default)]
+    pub photos: BTreeMap<String, Vec<u8>>,
 }
 pub fn path() -> PathBuf {
     model::data_path().with_file_name("contacts.rust.bin")
@@ -315,6 +317,33 @@ mod tests {
     fn phone_numbers_are_not_contact_names() {
         assert!(!meaningful("+7 999 123-45-67", "89991234567"));
         assert!(meaningful("Полина ❤️", "+79991234567"));
+    }
+    #[test]
+    fn local_photos_and_legacy_books_survive_private_reload() {
+        let old: Book = serde_json::from_str(r#"{"imported":{},"aliases":{}}"#).unwrap();
+        assert!(old.photos.is_empty());
+        let mut book = old;
+        let mut image = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(8, 8)
+            .write_to(&mut image, image::ImageFormat::Png)
+            .unwrap();
+        let photo = crate::avatars::prepare(image.get_ref()).unwrap();
+        book.photos.insert("+79991234567".into(), photo.clone());
+        book.set_alias("+79991234567", "Имя с фото").unwrap();
+        let path =
+            std::env::temp_dir().join(format!("meMessage-photo-test-{}.bin", std::process::id()));
+        book.save(&path).unwrap();
+        let raw = std::fs::read(&path).unwrap();
+        assert!(!raw.windows(8).any(|part| part == b"\x89PNG\r\n\x1a\n"));
+        let mut loaded = Book::load(&path).unwrap();
+        loaded
+            .imported
+            .insert("+79991234567".into(), "Имя iPhone".into());
+        loaded.save(&path).unwrap();
+        let loaded = Book::load(&path).unwrap();
+        assert_eq!(loaded.photos["+79991234567"], photo);
+        assert_eq!(loaded.display("+79991234567", ""), "Имя с фото");
+        std::fs::remove_file(path).unwrap();
     }
     #[test]
     fn pbap_requests_names_without_photos_and_combines_fragments() {

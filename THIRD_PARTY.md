@@ -23,3 +23,8 @@ to Apple Inc.; the metadata license does not license Apple's artwork.
 The loaded snapshot supplies Emoji 17.0, 1,916 base entries and 2,030 skin variants.
 Only entries with Apple artwork are offered. These files are local; message text
 and emoji searches are never sent to a remote asset service.
+
+## Application SVG icons
+
+The pictograms in assets/icons are project-authored SVG paths. They are embedded
+in the executable; they do not use emoji glyphs or Apple SF Symbols files.

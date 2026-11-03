@@ -62,3 +62,14 @@ Drafts survive conversation changes. Bluetooth work runs outside the UI thread;
 only sends briefly lock the recipient and draft. Search and filters affect real data.
 Verify preview at normal and minimum sizes, keyboard navigation, text wrapping,
 real iPhone receive, and no unsolicited sends during testing.
+
+
+## v0.6 polish
+
+All application pictograms come from embedded SVG sources in assets/icons;
+message content and the emoji picker retain their Unicode emoji. Built-in egui
+text roles all resolve to SF Pro. Local contact photos are center-cropped and
+shown as circles in the sidebar, header and contact editor. User photos are not
+committed or copied to the iPhone. Long contact titles ellipsize before the chevron.
+Native app QA replaces the web-only taste inspector; no landing-page composition,
+photography quotas or decorative motion are applied to this Messages interface.

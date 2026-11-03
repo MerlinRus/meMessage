@@ -9,3 +9,5 @@
 *.pdb
 *.tmp
 *.part
+
+/portable.flag

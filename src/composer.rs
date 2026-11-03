@@ -5,7 +5,7 @@ pub fn edit(ui: &mut Ui, draft: &mut String, input: Rect, enabled: bool) -> Text
         input.min + vec2(13., 0.),
         input.max - vec2(43., 0.),
     )));
-    child
+    let output = child
         .add_enabled_ui(enabled, |ui| {
             ScrollArea::vertical()
                 .id_salt("draft_scroll")
@@ -28,7 +28,19 @@ pub fn edit(ui: &mut Ui, draft: &mut String, input: Rect, enabled: bool) -> Text
                 })
                 .inner
         })
-        .inner
+        .inner;
+    // The scroll content can be taller than the composer. Expose the visible
+    // editor bounds to accessibility clients, rather than off-screen text rows.
+    let visible = output.response.rect.intersect(input);
+    ui.ctx().accesskit_node_builder(output.response.id, |node| {
+        node.set_bounds(accesskit::Rect {
+            x0: visible.left() as f64,
+            y0: visible.top() as f64,
+            x1: visible.right() as f64,
+            y1: visible.bottom() as f64,
+        })
+    });
+    output
 }
 
 #[cfg(test)]

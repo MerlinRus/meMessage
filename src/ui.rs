@@ -463,13 +463,11 @@ impl MessagesApp {
         if let Some(texture) = self.photo_textures.get(&phone) {
             crate::avatars::paint(ui.painter(), texture, center, radius);
         } else {
-            ui.painter()
-                .circle_filled(center, radius, Color32::from_rgb(199, 199, 206));
             paint_icon(
                 ui,
-                Rect::from_center_size(center, vec2(radius * 1.65, radius * 1.65)),
+                Rect::from_center_size(center, Vec2::splat(radius * 2.)),
                 Icon::Person,
-                Color32::from_rgb(249, 249, 251),
+                Color32::WHITE,
             );
         }
     }
@@ -1109,7 +1107,7 @@ impl MessagesApp {
                 ui,
                 Rect::from_center_size(
                     pos2(capsule.right() - 9., capsule.center().y),
-                    vec2(5., 8.),
+                    vec2(10., 12.),
                 ),
                 Icon::Chevron,
                 SECONDARY,
@@ -1769,14 +1767,17 @@ impl MessagesApp {
                 ui.small(format!("meMessage {}",env!("CARGO_PKG_VERSION")));
             });
                 ui.horizontal(|ui|{
+                    ui.spacing_mut().item_spacing.x=4.;
                     ui.label(RichText::new("Сделано by").size(12.).color(SECONDARY));
-                    let response=ui.allocate_response(vec2(57.,25.),Sense::click()).on_hover_cursor(CursorIcon::PointingHand).on_hover_text("Открыть maark.ru");
+                    let font=FontId::new(12.5,FontFamily::Name("Semibold".into()));
+                    let width=ui.painter().layout_no_wrap("MAARK".into(),font.clone(),BLUE).size().x;
+                    let response=ui.allocate_response(vec2(width,25.),Sense::click()).on_hover_cursor(CursorIcon::PointingHand).on_hover_text("Открыть maark.ru");
                     response.widget_info(||WidgetInfo::labeled(Role::Link,true,"MAARK"));
                     let t=ui.ctx().animate_bool_with_time(response.id.with("hover"),response.hovered(),if self.motion.enabled{0.16}else{0.});
                     let color=Color32::from_rgb((7.+65.*t) as u8,(131.-37.*t) as u8,255);
                     let center=response.rect.center()-vec2(0.,1.5*t);
-                    ui.painter().text(center,Align2::CENTER_CENTER,"MAARK",FontId::new(12.5,FontFamily::Name("Semibold".into())),color);
-                    if t>0.001{ui.painter().line_segment([pos2(center.x-22.*t,response.rect.bottom()-3.),pos2(center.x+22.*t,response.rect.bottom()-3.)],Stroke::new(1.,color.linear_multiply(t)));}
+                    ui.painter().text(center,Align2::CENTER_CENTER,"MAARK",font,color);
+                    if t>0.001{ui.painter().line_segment([pos2(center.x-width*0.5*t,response.rect.bottom()-3.),pos2(center.x+width*0.5*t,response.rect.bottom()-3.)],Stroke::new(1.,color.linear_multiply(t)));}
                     if response.clicked(){ui.ctx().open_url(OpenUrl::new_tab("https://maark.ru"));}
                 });
             ui.add_space(6.);
@@ -1855,7 +1856,11 @@ fn icon_button(ui: &mut Ui, rect: Rect, icon: Icon, label: &str, enabled: bool) 
     }
     paint_icon(
         ui,
-        rect.shrink(if matches!(icon, Icon::Arrow) { 7. } else { 7.5 }),
+        rect.shrink(match icon {
+            Icon::Arrow => 7.,
+            Icon::Settings => 4.,
+            _ => 7.5,
+        }),
         icon,
         if matches!(icon, Icon::Arrow) {
             Color32::WHITE
@@ -1971,6 +1976,7 @@ mod scenario_tests {
         draft_clip: Option<Rect>,
         elided_texts: Vec<String>,
         focused: bool,
+        text_rects: HashMap<String, Rect>,
     }
     impl Harness {
         fn new(size: Vec2) -> Self {
@@ -1989,6 +1995,7 @@ mod scenario_tests {
                 draft_clip: None,
                 elided_texts: Vec::new(),
                 focused: true,
+                text_rects: HashMap::new(),
             };
             harness.frame(vec![]);
             harness.frame(vec![]);
@@ -2013,6 +2020,17 @@ mod scenario_tests {
                 |ui| self.app.render(ui),
             );
             self.labels.clear();
+            self.text_rects = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    epaint::Shape::Text(text) => Some((
+                        text.galley.job.text.clone(),
+                        text.galley.rect.translate(text.pos.to_vec2()),
+                    )),
+                    _ => None,
+                })
+                .collect();
             self.elided_texts = output
                 .shapes
                 .iter()
@@ -2739,5 +2757,21 @@ mod scenario_tests {
                 .unwrap()
                 .unread
         );
+    }
+    #[test]
+    fn maker_credit_has_a_single_small_gap_at_both_display_scales() {
+        for scale in [1., 1.25, 1.5, 2.] {
+            let mut h = Harness::new(vec2(830., 570.));
+            h.ctx.set_pixels_per_point(scale);
+            h.key(Key::Comma, Modifiers::CTRL);
+            h.frame(vec![]);
+            let by = h.text_rects["Сделано by"];
+            let maker = h.text_rects["MAARK"];
+            let gap = maker.left() - by.right();
+            assert!(
+                (3.0..=5.0).contains(&gap),
+                "Credit gap must be 4 DIP, got {gap} at scale {scale}"
+            );
+        }
     }
 }

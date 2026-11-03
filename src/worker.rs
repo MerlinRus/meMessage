@@ -21,6 +21,8 @@ use std::{
 };
 
 pub enum Command {
+    Connect,
+    MarkRead(Vec<String>),
     Refresh,
     SyncHistory,
     SyncContacts,
@@ -32,6 +34,7 @@ pub enum Command {
     Stop,
 }
 pub enum Event {
+    Connecting,
     Snapshot(Vec<Message>),
     Connection(bool, String),
     Sent(String),
@@ -149,7 +152,7 @@ fn refresh_history(cache: &mut Vec<Message>, history: bool) -> io::Result<()> {
     let known: HashSet<String> = cache.iter().map(|m| m.id.clone()).collect();
     for mut message in records {
         if let Some(existing) = cache.iter_mut().find(|m| m.id == message.id) {
-            existing.read = message.read;
+            existing.read |= message.read;
             if contacts::meaningful(&message.name, &message.phone) {
                 existing.name = message.name;
             }
@@ -287,7 +290,7 @@ pub fn start(
                 .unwrap_or_default();
             let command = if first {
                 first = false;
-                Command::Refresh
+                Command::Connect
             } else {
                 match rx.recv_timeout(Duration::from_secs(settings.poll_seconds)) {
                     Ok(command) => command,
@@ -302,8 +305,17 @@ pub fn start(
                 .unwrap_or_default();
             match command {
                 Command::Stop => break,
+                Command::MarkRead(ids) => {
+                    if model::mark_read(&mut cache, &ids) {
+                        save(&cache, &mut saved_cache, settings.save_history);
+                        emit(Event::Snapshot(cache.clone()));
+                    }
+                }
                 Command::SyncContacts => sync_contacts(),
-                Command::Refresh | Command::SyncHistory => {
+                Command::Connect | Command::Refresh | Command::SyncHistory => {
+                    if !was_connected {
+                        emit(Event::Connecting);
+                    }
                     let historical = matches!(command, Command::SyncHistory)
                         || (!was_connected && settings.sync_history_on_connect);
                     match refresh_history(&mut cache, historical) {

@@ -98,6 +98,28 @@ pub fn conversations(messages: &[Message]) -> Vec<Conversation> {
     result.sort_by_key(|c| std::cmp::Reverse(c.time));
     result
 }
+pub fn mark_read(messages: &mut [Message], ids: &[String]) -> bool {
+    let ids: std::collections::HashSet<_> = ids.iter().map(String::as_str).collect();
+    let mut changed = false;
+    for message in messages {
+        if !message.outgoing && !message.read && ids.contains(message.id.as_str()) {
+            message.read = true;
+            changed = true;
+        }
+    }
+    changed
+}
+// A delayed phone snapshot must not undo a read already observed on this PC.
+pub fn preserve_read(previous: &[Message], incoming: &mut [Message]) {
+    let read: std::collections::HashSet<_> = previous
+        .iter()
+        .filter(|message| message.read)
+        .map(|message| message.id.as_str())
+        .collect();
+    for message in incoming {
+        message.read |= read.contains(message.id.as_str());
+    }
+}
 pub fn time_label(timestamp: i64) -> String {
     let Some(time) = Local.timestamp_opt(timestamp, 0).single() else {
         return String::new();
@@ -268,6 +290,35 @@ mod tests {
         let loaded = load(&path).unwrap();
         assert_eq!(loaded[0].text, "Привет 👋");
         assert_eq!(loaded[0].state, SendState::Unconfirmed);
+        fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn local_read_survives_private_reload_without_marking_later_messages() {
+        let message = Message {
+            id: "seen".into(),
+            handle: String::new(),
+            phone: "+79990000000".into(),
+            name: String::new(),
+            text: "Read fixture".into(),
+            timestamp: 1,
+            outgoing: false,
+            read: false,
+            state: SendState::Received,
+        };
+        let mut local = vec![message.clone()];
+        assert!(mark_read(&mut local, &["seen".into()]));
+        assert!(!mark_read(&mut local, &["seen".into()]));
+        let mut later = message.clone();
+        later.id = "not-seen".into();
+        let mut remote = vec![message, later];
+        preserve_read(&local, &mut remote);
+        assert!(remote[0].read);
+        assert!(!remote[1].read);
+        let path = std::env::temp_dir().join(format!("meMessage-read-{}.bin", std::process::id()));
+        save(&path, &remote).unwrap();
+        let restored = load(&path).unwrap();
+        assert!(restored.iter().find(|m| m.id == "seen").unwrap().read);
+        assert!(!restored.iter().find(|m| m.id == "not-seen").unwrap().read);
         fs::remove_file(path).unwrap();
     }
     #[test]

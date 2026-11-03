@@ -46,6 +46,7 @@ pub struct MessagesApp {
     preview: bool,
     sending: bool,
     connected: bool,
+    connecting: bool,
     status: String,
     error: Option<String>,
     commands: Option<Sender<Command>>,
@@ -226,6 +227,7 @@ impl MessagesApp {
             preview,
             sending: false,
             connected: false,
+            connecting: !preview,
             status: if preview {
                 "Предпросмотр · без подключения"
             } else {
@@ -308,8 +310,15 @@ impl MessagesApp {
             .unwrap_or_default();
         for event in events {
             match event {
+                Event::Connecting => {
+                    self.connecting = true;
+                    if !self.connected {
+                        self.status = "Подключение к iPhone…".into();
+                    }
+                }
                 Event::StorageError(error) => self.error = Some(error),
-                Event::Snapshot(messages) => {
+                Event::Snapshot(mut messages) => {
+                    model::preserve_read(&self.messages, &mut messages);
                     if self.connected {
                         self.motion.register(&self.messages, &messages);
                     }
@@ -330,6 +339,7 @@ impl MessagesApp {
                     }
                 }
                 Event::Connection(connected, text) => {
+                    self.connecting = false;
                     self.connected = connected;
                     if connected {
                         self.status = text;
@@ -392,6 +402,48 @@ impl MessagesApp {
     fn rebuild_conversations(&mut self) {
         self.conversations = model::conversations(&self.messages);
         self.contacts.apply(&mut self.conversations);
+    }
+    fn connect(&mut self) {
+        if self.preview || self.connected || self.connecting {
+            return;
+        }
+        if self
+            .commands
+            .as_ref()
+            .is_some_and(|commands| commands.send(Command::Connect).is_ok())
+        {
+            self.connecting = true;
+            self.status = "Подключение к iPhone…".into();
+            self.connection_error = None;
+        } else {
+            self.connection_error =
+                Some("Служба подключения остановлена. Перезапусти приложение.".into());
+        }
+    }
+    fn mark_selected_read(&mut self) {
+        let Some(phone) = &self.selected else {
+            return;
+        };
+        let ids: Vec<_> = self
+            .messages
+            .iter()
+            .filter(|message| message.phone == *phone && !message.outgoing && !message.read)
+            .map(|message| message.id.clone())
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        if !self.preview
+            && !self
+                .commands
+                .as_ref()
+                .is_some_and(|commands| commands.send(Command::MarkRead(ids.clone())).is_ok())
+        {
+            return;
+        }
+        if model::mark_read(&mut self.messages, &ids) {
+            self.rebuild_conversations();
+        }
     }
     fn contact_phone(&self) -> Option<String> {
         self.selected.clone().or_else(|| {
@@ -790,7 +842,15 @@ impl MessagesApp {
         }
         let rows = Rect::from_min_max(
             pos2(rect.left() + 5., search.bottom() + 10.),
-            pos2(rect.right() - 5., rect.bottom() - 30.),
+            pos2(
+                rect.right() - 5.,
+                rect.bottom()
+                    - if !self.preview && !self.connected {
+                        70.
+                    } else {
+                        30.
+                    },
+            ),
         );
         let query = self.search.to_lowercase();
         let filtered: Vec<Conversation> =
@@ -909,6 +969,30 @@ impl MessagesApp {
                     });
             },
         );
+        if !self.preview && !self.connected {
+            let bounds = Rect::from_min_size(
+                pos2(rect.left() + 10., rect.bottom() - 66.),
+                vec2(rect.width() - 20., 28.),
+            );
+            let response = ui
+                .scope_builder(UiBuilder::new().max_rect(bounds), |ui| {
+                    ui.add_enabled_ui(!self.connecting, |ui| {
+                        ui.add_sized(
+                            bounds.size(),
+                            Button::new(if self.connecting {
+                                "Подключение…"
+                            } else {
+                                "Подключить"
+                            }),
+                        )
+                    })
+                })
+                .inner
+                .inner;
+            if response.clicked() {
+                self.connect();
+            }
+        }
         let settings_button = icon_button(
             ui,
             Rect::from_min_size(pos2(rect.left() + 9., rect.bottom() - 31.), vec2(30., 26.)),
@@ -1451,6 +1535,12 @@ impl eframe::App for MessagesApp {
 impl MessagesApp {
     fn render(&mut self, root_ui: &mut Ui) {
         let ctx = root_ui.ctx().clone();
+        if !self.settings_open
+            && !self.new_mode
+            && ctx.input(|input| input.focused && input.viewport().minimized != Some(true))
+        {
+            self.mark_selected_read();
+        }
         if self.preferences.auto_focus
             && !self.settings_open
             && !Popup::is_any_open(&ctx)
@@ -1880,6 +1970,7 @@ mod scenario_tests {
         opened_urls: Vec<String>,
         draft_clip: Option<Rect>,
         elided_texts: Vec<String>,
+        focused: bool,
     }
     impl Harness {
         fn new(size: Vec2) -> Self {
@@ -1897,18 +1988,25 @@ mod scenario_tests {
                 opened_urls: Vec::new(),
                 draft_clip: None,
                 elided_texts: Vec::new(),
+                focused: true,
             };
             harness.frame(vec![]);
             harness.frame(vec![]);
             harness
         }
         fn frame(&mut self, events: Vec<Input>) {
+            for event in &events {
+                if let Input::WindowFocused(focused) = event {
+                    self.focused = *focused;
+                }
+            }
             self.time += 1. / 60.;
             self.app.receive(&self.ctx);
             let mut output = self.ctx.run_ui(
                 RawInput {
                     screen_rect: Some(Rect::from_min_size(Pos2::ZERO, self.size)),
                     time: Some(self.time),
+                    focused: self.focused,
                     events,
                     ..Default::default()
                 },
@@ -2481,5 +2579,165 @@ mod scenario_tests {
                 "A short contact name must fit beside the header chevron"
             );
         }
+    }
+    #[test]
+    fn opening_a_chat_clears_its_unread_marker_and_old_snapshots_do_not_restore_it() {
+        let mut h = Harness::new(vec2(830., 570.));
+        let phone = h.app.conversations[1].phone.clone();
+        for message in &mut h.app.messages {
+            if message.phone == phone {
+                message.read = false;
+            }
+        }
+        h.app.rebuild_conversations();
+        let old_snapshot = h.app.messages.clone();
+        assert!(
+            h.app
+                .conversations
+                .iter()
+                .find(|c| c.phone == phone)
+                .unwrap()
+                .unread
+        );
+        h.app.select(&phone);
+        h.frame(vec![]);
+        assert!(
+            !h.app
+                .conversations
+                .iter()
+                .find(|c| c.phone == phone)
+                .unwrap()
+                .unread,
+            "Opening the chat must clear its unread dot"
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        h.app.events = Some(rx);
+        h.app.select(&h.app.conversations[0].phone.clone());
+        tx.send(Event::Snapshot(old_snapshot)).unwrap();
+        h.frame(vec![]);
+        assert!(
+            !h.app
+                .conversations
+                .iter()
+                .find(|c| c.phone == phone)
+                .unwrap()
+                .unread,
+            "Polling must not restore an already-read dot"
+        );
+    }
+    #[test]
+    fn disconnected_sidebar_offers_an_immediate_connection_attempt() {
+        let mut h = Harness::new(vec2(830., 570.));
+        let (tx, rx) = std::sync::mpsc::channel();
+        h.app.preview = false;
+        h.app.commands = Some(tx);
+        h.frame(vec![]);
+        let button = h.labels.get("Подключить").copied();
+        h.app.preview = true;
+        assert!(button.is_some(), "Disconnected app needs a Connect button");
+        h.app.preview = false;
+        h.click("Подключить");
+        let request = rx.try_recv();
+        h.app.preview = true;
+        assert!(
+            request.is_ok(),
+            "Click must request a connection immediately"
+        );
+    }
+    #[test]
+    fn connect_button_tracks_failure_retry_and_success_without_duplicate_commands() {
+        for size in [vec2(830., 570.), vec2(1120., 760.)] {
+            let mut h = Harness::new(size);
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (events, inbox) = std::sync::mpsc::channel();
+            h.app.preview = false;
+            h.app.commands = Some(tx);
+            h.app.events = Some(inbox);
+            h.frame(vec![]);
+            let button = h.labels["Подключить"];
+            assert!(Rect::from_min_size(Pos2::ZERO, size).contains_rect(button));
+            h.click("Подключить");
+            let first = rx.try_recv();
+            let busy = h.app.connecting;
+            h.app.connect();
+            let duplicate = rx.try_recv();
+            h.app.preview = true;
+            assert!(matches!(first, Ok(Command::Connect)));
+            assert!(busy);
+            assert!(duplicate.is_err());
+            h.app.preview = false;
+            events
+                .send(Event::Connection(false, "Телефон недоступен".into()))
+                .unwrap();
+            h.frame(vec![]);
+            let retry = h.labels.contains_key("Подключить");
+            h.app.preview = true;
+            assert!(retry);
+            h.app.preview = false;
+            h.click("Подключить");
+            let second = rx.try_recv();
+            h.app.preview = true;
+            assert!(matches!(second, Ok(Command::Connect)));
+            h.app.preview = false;
+            events
+                .send(Event::Connection(true, "iPhone подключён".into()))
+                .unwrap();
+            h.frame(vec![]);
+            let connected =
+                h.app.connected && !h.app.connecting && !h.labels.contains_key("Подключить");
+            h.app.preview = true;
+            assert!(connected);
+        }
+    }
+    #[test]
+    fn incoming_messages_are_read_only_when_their_chat_is_visible_and_focused() {
+        let mut h = Harness::new(vec2(830., 570.));
+        let phone = h.app.selected.clone().unwrap();
+        let mut incoming = h
+            .app
+            .messages
+            .iter()
+            .find(|m| m.phone == phone && !m.outgoing)
+            .unwrap()
+            .clone();
+        incoming.id = "new-unseen".into();
+        incoming.read = false;
+        let (tx, rx) = std::sync::mpsc::channel();
+        h.app.events = Some(rx);
+        h.frame(vec![Input::WindowFocused(false)]);
+        let mut snapshot = h.app.messages.clone();
+        snapshot.push(incoming);
+        tx.send(Event::Snapshot(snapshot)).unwrap();
+        h.frame(vec![]);
+        assert!(
+            h.app
+                .conversations
+                .iter()
+                .find(|c| c.phone == phone)
+                .unwrap()
+                .unread,
+            "Background polling must not mark a message read"
+        );
+        h.app.open_settings();
+        h.frame(vec![Input::WindowFocused(true)]);
+        assert!(
+            h.app
+                .conversations
+                .iter()
+                .find(|c| c.phone == phone)
+                .unwrap()
+                .unread,
+            "Settings hide the conversation"
+        );
+        h.key(Key::Escape, Modifiers::NONE);
+        h.frame(vec![]);
+        assert!(
+            !h.app
+                .conversations
+                .iter()
+                .find(|c| c.phone == phone)
+                .unwrap()
+                .unread
+        );
     }
 }

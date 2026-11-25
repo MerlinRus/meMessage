@@ -13,6 +13,7 @@ pub enum SendState {
     Received,
     Pending,
     Accepted,
+    Failed,
     Unconfirmed,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,6 +105,16 @@ pub fn mark_read(messages: &mut [Message], ids: &[String]) -> bool {
     for message in messages {
         if !message.outgoing && !message.read && ids.contains(message.id.as_str()) {
             message.read = true;
+            changed = true;
+        }
+    }
+    changed
+}
+pub fn recover_interrupted_sends(messages: &mut [Message]) -> bool {
+    let mut changed = false;
+    for message in messages {
+        if message.state == SendState::Pending {
+            message.state = SendState::Unconfirmed;
             changed = true;
         }
     }
@@ -225,11 +236,8 @@ pub fn load(path: &Path) -> io::Result<Vec<Message>> {
     }
     let bytes = protect(&fs::read(path)?, false)?;
     let mut records: Vec<Message> = serde_json::from_slice(&bytes)?;
-    for m in &mut records {
-        if m.state == SendState::Pending {
-            m.state = SendState::Unconfirmed;
-        }
-    }
+    recover_interrupted_sends(&mut records);
+    records.sort_by_key(|m| m.timestamp);
     Ok(records)
 }
 pub fn save(path: &Path, messages: &[Message]) -> io::Result<()> {

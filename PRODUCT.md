@@ -35,3 +35,18 @@ Keep worker I/O outside the UI thread. Preserve drafts on dialogue changes and
 failed sends. Respect Windows animation settings and stop repainting when settled.
 Use stable widget identities and the shared geometry; measure text at the exact
 editor width. Verify the real rendered component, not a duplicate implementation.
+
+## Everyday operation
+
+Pinned/muted chat preferences share encrypted Settings and survive PBAP updates.
+Search returns individual locally stored messages and jumps to the selected bubble;
+it does not promise an iPhone archive. Results are cached and revealed in batches.
+Notifications respect global preferences, contact mute, local read and active chat;
+hidden previews never include message text. Initial sync and old pages stay quiet.
+Reconnect uses bounded backoff and a native resume event, never retries a message.
+Failed before submission and unknown acknowledgement are distinct persistent states.
+Manual retry requires confirmation; accepting a retry preserves the next draft.
+Native tray has Open/Settings/Exit; hiding requires a working tray. Close/exit handling
+must run in App::logic as hidden/occluded windows may not execute App::ui.
+Autostart is opt-in, per-user, quotes the executable path and starts in the tray;
+the single-instance lock prevents concurrent writers in current builds.

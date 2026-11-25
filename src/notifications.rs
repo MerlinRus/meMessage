@@ -302,20 +302,54 @@ pub fn toast_xml(title: &str, text: &str) -> String {
         escape(&body)
     )
 }
+pub fn preview_text(text: &str, visible: bool) -> &str {
+    if visible {
+        crate::media::display(text)
+    } else {
+        "Новое сообщение"
+    }
+}
+pub fn should_notify(
+    message: &Message,
+    settings: &crate::settings::Settings,
+    active: Option<&str>,
+) -> bool {
+    settings.notifications
+        && !message.outgoing
+        && !message.read
+        && active != Some(message.phone.as_str())
+        && !settings
+            .chats
+            .get(&message.phone)
+            .is_some_and(|chat| chat.muted)
+}
 #[derive(Default)]
 pub struct NotificationTracker {
     seen: HashSet<String>,
     initialized: bool,
+    latest: i64,
 }
 impl NotificationTracker {
     pub fn observe<'a>(&mut self, messages: &'a [Message]) -> Vec<&'a Message> {
         let mut fresh = Vec::new();
         for message in messages {
-            if self.seen.insert(message.id.clone()) && self.initialized && !message.outgoing {
+            if self.seen.insert(message.id.clone())
+                && self.initialized
+                && !message.outgoing
+                && message.timestamp >= self.latest
+            {
                 fresh.push(message);
             }
         }
         self.initialized = true;
+        self.latest = self.latest.max(
+            messages
+                .iter()
+                .filter(|m| !m.outgoing)
+                .map(|m| m.timestamp)
+                .max()
+                .unwrap_or(0),
+        );
         fresh
     }
 }
@@ -335,6 +369,47 @@ mod tests {
             read: false,
             state: SendState::Received,
         }
+    }
+    #[test]
+    fn privacy_mute_read_and_active_chat_control_new_notifications() {
+        let mut settings = crate::settings::Settings::default();
+        let mut incoming = message("new", false);
+        assert!(should_notify(&incoming, &settings, None));
+        assert!(!should_notify(&incoming, &settings, Some(&incoming.phone)));
+        settings.chats.insert(
+            incoming.phone.clone(),
+            crate::settings::ChatSettings {
+                muted: true,
+                ..Default::default()
+            },
+        );
+        assert!(!should_notify(&incoming, &settings, None));
+        settings.chats.clear();
+        incoming.read = true;
+        assert!(!should_notify(&incoming, &settings, None));
+        incoming.read = false;
+        settings.notifications = false;
+        assert!(!should_notify(&incoming, &settings, None));
+        assert_eq!(preview_text("private message ❤️", false), "Новое сообщение");
+        assert!(!toast_xml("Анна", preview_text("private message ❤️", false)).contains("private"));
+    }
+    #[test]
+    fn reconnect_notifies_recent_incoming_but_not_historical_pages_or_repeats() {
+        let mut tracker = NotificationTracker::default();
+        let mut baseline = message("known", false);
+        baseline.timestamp = 100;
+        tracker.observe(&[baseline.clone()]);
+        let mut historical = message("old-page", false);
+        historical.timestamp = 50;
+        let mut fresh = message("while-disconnected", false);
+        fresh.timestamp = 101;
+        let snapshot = vec![historical, baseline, fresh];
+        let new = tracker.observe(&snapshot);
+        assert_eq!(
+            new.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["while-disconnected"]
+        );
+        assert!(tracker.observe(&snapshot).is_empty());
     }
     #[test]
     fn notifications_only_for_new_incoming_after_baseline() {

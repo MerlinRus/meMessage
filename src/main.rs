@@ -3,6 +3,7 @@ mod avatars;
 mod capabilities;
 mod composer;
 mod contacts;
+mod desktop;
 mod emoji;
 mod icons;
 mod layout;
@@ -12,6 +13,7 @@ mod model;
 mod motion;
 mod notifications;
 mod platform;
+mod search;
 mod settings;
 mod transport;
 mod ui;
@@ -104,6 +106,15 @@ fn main() -> eframe::Result {
         std::process::exit(if result.is_ok() { 0 } else { 1 });
     }
     let preview = args.iter().any(|a| a == "--preview");
+    let _instance = if preview {
+        None
+    } else {
+        match desktop::Instance::acquire() {
+            Ok(Some(instance)) => Some(instance),
+            Ok(None) => return Ok(()),
+            Err(error) => return Err(eframe::Error::AppCreation(error.into())),
+        }
+    };
     let compact = preview && args.iter().any(|a| a == "--compact");
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()

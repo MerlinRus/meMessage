@@ -17,6 +17,8 @@ pub enum Icon {
     Close,
     Minimize,
     Maximize,
+    Pin,
+    BellOff,
 }
 impl Icon {
     pub fn source(self) -> (&'static str, &'static [u8]) {
@@ -44,6 +46,8 @@ impl Icon {
             Self::Close => svg!("close"),
             Self::Minimize => svg!("minimize"),
             Self::Maximize => svg!("maximize"),
+            Self::Pin => svg!("pin"),
+            Self::BellOff => svg!("bell-off"),
         }
     }
 }
@@ -79,6 +83,8 @@ mod tests {
             Icon::Close,
             Icon::Minimize,
             Icon::Maximize,
+            Icon::Pin,
+            Icon::BellOff,
         ] {
             let (_, svg) = icon.source();
             let image = egui_extras::image::load_svg_bytes(svg, &Default::default()).unwrap();

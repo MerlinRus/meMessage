@@ -1,6 +1,17 @@
 use crate::model;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, io, path::Path};
+use std::{
+    collections::{BTreeMap, HashMap},
+    io,
+    path::Path,
+};
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChatSettings {
+    pub pinned: bool,
+    pub muted: bool,
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -14,6 +25,9 @@ pub struct Settings {
     pub save_history: bool,
     pub save_drafts: bool,
     pub minimize_on_close: bool,
+    pub autostart: bool,
+    pub notification_preview: bool,
+    pub chats: BTreeMap<String, ChatSettings>,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -27,6 +41,9 @@ impl Default for Settings {
             save_history: true,
             save_drafts: true,
             minimize_on_close: false,
+            autostart: false,
+            notification_preview: true,
+            chats: BTreeMap::new(),
         }
     }
 }
@@ -54,6 +71,7 @@ pub struct Drafts {
     pub new_mode: bool,
     pub recipient: String,
     pub uncertain_submission: bool,
+    pub submitted: Option<(String, String)>,
 }
 impl Drafts {
     pub fn load(path: &Path) -> io::Result<Self> {
@@ -92,6 +110,9 @@ mod tests {
         s.poll_seconds = 999;
         s.normalize();
         assert_eq!(s.poll_seconds, 60);
+        assert!(s.chats.is_empty());
+        assert!(s.notification_preview);
+        assert!(!s.autostart);
     }
     #[test]
     fn settings_and_drafts_survive_encrypted_storage() {
@@ -101,6 +122,14 @@ mod tests {
         let s = Settings {
             auto_focus: false,
             poll_seconds: 12,
+            notification_preview: false,
+            chats: BTreeMap::from([(
+                "+79991234567".into(),
+                ChatSettings {
+                    pinned: true,
+                    muted: true,
+                },
+            )]),
             ..Default::default()
         };
         s.save(&config).unwrap();
@@ -109,11 +138,14 @@ mod tests {
         let d = Drafts {
             messages: HashMap::from([("+79991234567".into(), "Черновик ❤️".into())]),
             selected: Some("+79991234567".into()),
+            submitted: Some(("+79991234567".into(), "Незавершённая отправка".into())),
             ..Default::default()
         };
         d.save(&path).unwrap();
         assert!(!String::from_utf8_lossy(&std::fs::read(&path).unwrap()).contains("Черновик"));
-        assert_eq!(Drafts::load(&path).unwrap().messages, d.messages);
+        let restored = Drafts::load(&path).unwrap();
+        assert_eq!(restored.messages, d.messages);
+        assert_eq!(restored.submitted, d.submitted);
         std::fs::remove_file(config).unwrap();
         std::fs::remove_file(path).unwrap();
         std::fs::remove_dir(root).unwrap();

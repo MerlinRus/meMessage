@@ -17,7 +17,7 @@ use std::{
         mpsc::{self, Receiver, Sender},
     },
     thread,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 pub enum Command {
@@ -37,6 +37,7 @@ pub enum Event {
     Connecting,
     Snapshot(Vec<Message>),
     Connection(bool, String),
+    ReconnectIn(u64),
     Sent(String),
     SendFailed(String),
     OpenConversation(String),
@@ -44,6 +45,60 @@ pub enum Event {
     Contacts(Book),
     ContactsStatus(bool, String),
     StorageError(String),
+}
+
+struct PollSchedule {
+    failures: u32,
+    next: SystemTime,
+}
+
+enum Submission {
+    Accepted(String),
+    Failed(String),
+    Unconfirmed,
+}
+fn submit_once<T: transport::Exchange>(
+    session: io::Result<MapClient<T>>,
+    target: &str,
+    text: &str,
+) -> Submission {
+    if let Err(error) = crate::map::bmessage(target, text) {
+        return Submission::Failed(error.to_string());
+    }
+    match session {
+        Err(error) => Submission::Failed(error.to_string()),
+        Ok(mut session) => match session.send(target, text) {
+            Ok(handle) => Submission::Accepted(handle),
+            Err(_) => Submission::Unconfirmed,
+        },
+    }
+}
+impl PollSchedule {
+    fn new() -> Self {
+        Self {
+            failures: 0,
+            next: SystemTime::now(),
+        }
+    }
+    fn remaining(&self) -> Duration {
+        self.next
+            .duration_since(SystemTime::now())
+            .unwrap_or_default()
+    }
+    fn completed(&mut self, connected: bool, period: u64) -> u64 {
+        self.failures = if connected {
+            0
+        } else {
+            self.failures.saturating_add(1)
+        };
+        let seconds = if connected {
+            period.clamp(2, 60)
+        } else {
+            (3u64 << self.failures.min(5).saturating_sub(1)).min(30)
+        };
+        self.next = SystemTime::now() + Duration::from_secs(seconds);
+        seconds
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -219,6 +274,7 @@ pub fn start(
     path: PathBuf,
     book: Arc<Mutex<Book>>,
     preferences: Arc<Mutex<crate::settings::Settings>>,
+    active_conversation: Arc<Mutex<Option<String>>>,
 ) -> (Sender<Command>, Receiver<Event>) {
     let (commands, rx) = mpsc::channel();
     let (tx, events) = mpsc::channel();
@@ -254,6 +310,8 @@ pub fn start(
         let mut first = true;
         let mut initial_contacts = true;
         let mut was_connected = false;
+        let mut schedule = PollSchedule::new();
+        let mut baseline = true;
         let sync_contacts = || {
             emit(Event::ContactsStatus(
                 true,
@@ -284,17 +342,16 @@ pub fn start(
             }
         };
         loop {
-            let settings = preferences
-                .lock()
-                .map(|settings| settings.clone())
-                .unwrap_or_default();
             let command = if first {
                 first = false;
                 Command::Connect
             } else {
-                match rx.recv_timeout(Duration::from_secs(settings.poll_seconds)) {
+                match rx.recv_timeout(schedule.remaining().min(Duration::from_secs(1))) {
                     Ok(command) => command,
-                    Err(mpsc::RecvTimeoutError::Timeout) => Command::Refresh,
+                    Err(mpsc::RecvTimeoutError::Timeout) if schedule.remaining().is_zero() => {
+                        Command::Refresh
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
                     Err(_) => break,
                 }
             };
@@ -320,9 +377,23 @@ pub fn start(
                         || (!was_connected && settings.sync_history_on_connect);
                     match refresh_history(&mut cache, historical) {
                         Ok(()) => {
+                            let restored = !was_connected && !baseline;
                             was_connected = true;
+                            schedule.completed(true, settings.poll_seconds);
+                            let current_settings =
+                                preferences.lock().map(|s| s.clone()).unwrap_or_default();
+                            let active = active_conversation
+                                .lock()
+                                .ok()
+                                .and_then(|phone| phone.clone());
                             for message in notification_tracker.observe(&cache) {
-                                if historical || !settings.notifications {
+                                if baseline
+                                    || !crate::notifications::should_notify(
+                                        message,
+                                        &current_settings,
+                                        active.as_deref(),
+                                    )
+                                {
                                     continue;
                                 }
                                 if let Some(notifications) = &mut notifications {
@@ -339,16 +410,28 @@ pub fn start(
                                     });
                                     if let Err(error) = notifications.show_with_sound(
                                         &title,
-                                        &message.text,
+                                        crate::notifications::preview_text(
+                                            &message.text,
+                                            current_settings.notification_preview,
+                                        ),
                                         Some(click),
-                                        settings.notification_sound,
+                                        current_settings.notification_sound,
                                     ) {
                                         emit(Event::NotificationError(error));
                                     }
                                 }
                             }
+                            baseline = false;
                             emit(Event::Snapshot(cache.clone()));
-                            emit(Event::Connection(true, "iPhone подключён".into()));
+                            emit(Event::Connection(
+                                true,
+                                if restored {
+                                    "Связь восстановлена"
+                                } else {
+                                    "iPhone подключён"
+                                }
+                                .into(),
+                            ));
                             save(&cache, &mut saved_cache, settings.save_history);
                             if initial_contacts {
                                 initial_contacts = false;
@@ -358,6 +441,9 @@ pub fn start(
                         Err(error) => {
                             was_connected = false;
                             emit(Event::Connection(false, error.to_string()));
+                            emit(Event::ReconnectIn(
+                                schedule.completed(false, settings.poll_seconds),
+                            ));
                         }
                     }
                 }
@@ -390,26 +476,35 @@ pub fn start(
                     save(&cache, &mut saved_cache, settings.save_history);
                     emit(Event::Snapshot(cache.clone()));
                     // No retries: a lost acknowledgement must never duplicate a real message.
-                    let result = transport::find_iphone()
-                        .and_then(MapClient::connect)
-                        .and_then(|mut session| session.send(&target, &text));
+                    let session = transport::find_iphone().and_then(MapClient::connect);
                     let message = cache.iter_mut().find(|m| m.id == id).unwrap();
-                    match result {
-                        Ok(handle) => {
+                    let completion = match submit_once(session, &target, &text) {
+                        Submission::Accepted(handle) => {
                             if !handle.is_empty() {
                                 message.id = format!("sent:{handle}");
                             }
                             message.handle = handle;
                             message.state = SendState::Accepted;
-                            emit(Event::Sent(phone));
+                            Event::Sent(phone)
                         }
-                        Err(_) => {
+                        Submission::Unconfirmed => {
                             message.state = SendState::Unconfirmed;
-                            emit(Event::SendFailed("Проверь сообщение на iPhone перед повтором: оно могло уйти. Черновик сохранён.".into()));
+                            Event::SendFailed("Проверь сообщение на iPhone перед повтором: оно могло уйти. Текст сохранён.".into())
                         }
-                    }
+                        Submission::Failed(error) => {
+                            message.state = SendState::Failed;
+                            was_connected = false;
+                            emit(Event::Connection(false, error.to_string()));
+                            emit(Event::ReconnectIn(
+                                schedule.completed(false, settings.poll_seconds),
+                            ));
+                            Event::SendFailed("Не отправлено: нет соединения с iPhone. Текст сохранён; подключись и повтори вручную.".into())
+                        }
+                    };
                     save(&cache, &mut saved_cache, settings.save_history);
                     emit(Event::Snapshot(cache.clone()));
+                    // The UI may exit on this event: persist the outcome first.
+                    emit(completion);
                 }
             }
         }
@@ -420,6 +515,66 @@ pub fn start(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reconnect_backoff_is_bounded_and_success_restores_normal_polling() {
+        let mut schedule = PollSchedule::new();
+        assert!(schedule.remaining().is_zero());
+        for seconds in [3, 6, 12, 24, 30, 30, 30] {
+            assert_eq!(schedule.completed(false, 3), seconds);
+            assert!(schedule.remaining() <= Duration::from_secs(seconds));
+        }
+        assert_eq!(schedule.completed(true, 2), 2);
+        assert_eq!(schedule.completed(false, 2), 3);
+        schedule.next = SystemTime::now() - Duration::from_secs(3600);
+        assert!(
+            schedule.remaining().is_zero(),
+            "Resume after sleep must refresh immediately"
+        );
+    }
+    #[test]
+    fn submission_distinguishes_preflight_failure_from_a_lost_ack_without_retry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Fake {
+            calls: Arc<AtomicUsize>,
+            lost: bool,
+        }
+        impl transport::Exchange for Fake {
+            fn exchange(&mut self, packet: &[u8]) -> io::Result<Vec<u8>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                if packet[0] == 0x80 {
+                    return Ok(vec![0xa0, 0, 7, 0x10, 0, 0x10, 0]);
+                }
+                if packet[0] == 0x82 && self.lost {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "lost ack"));
+                }
+                Ok(vec![0xa0, 0, 3])
+            }
+        }
+        let missing: io::Result<MapClient<Fake>> = Err(io::Error::other("offline"));
+        assert!(matches!(
+            submit_once(missing, "+79991234567", "test"),
+            Submission::Failed(_)
+        ));
+        for lost in [false, true] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let session = MapClient::open(Fake {
+                calls: calls.clone(),
+                lost,
+            });
+            assert_eq!(calls.load(Ordering::SeqCst), 4);
+            let result = submit_once(session, "+79991234567", "test");
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                5,
+                "Exactly one upload, even if its acknowledgement is lost"
+            );
+            assert!(if lost {
+                matches!(result, Submission::Unconfirmed)
+            } else {
+                matches!(result, Submission::Accepted(_))
+            });
+        }
+    }
     #[test]
     fn parses_real_map_attributes_without_losing_unicode() {
         let xml = r#"<?xml version="1.0"?><MAP-msg-listing version="1.0"><msg handle="ABC001" sender_addressing="+79991234567" sender_name="Анна" datetime="20261102T145600" subject="Привет &amp; пока" read="yes"/></MAP-msg-listing>"#;

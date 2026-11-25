@@ -232,7 +232,7 @@ impl<T: Exchange> MapClient<T> {
         Err(io::Error::other("Empty upload"))
     }
 }
-pub fn normalize_phone(value: &str) -> io::Result<String> {
+fn normalize_phone(value: &str) -> io::Result<String> {
     let clean: String = value
         .chars()
         .filter(|c| !c.is_whitespace() && !['(', ')', '-'].contains(c))
@@ -240,10 +240,37 @@ pub fn normalize_phone(value: &str) -> io::Result<String> {
     let digits = clean.strip_prefix('+').unwrap_or(&clean);
     if !(7..=15).contains(&digits.len()) || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return Err(io::Error::other(
-            "Укажи номер телефона: от 7 до 15 цифр, можно с + в начале.",
+            "Укажи номер телефона (7–15 цифр) или email для iMessage.",
         ));
     }
     Ok(clean)
+}
+pub fn normalize_recipient(value: &str) -> io::Result<String> {
+    let value = value.trim();
+    let Some((local, domain)) = value.split_once('@') else {
+        return normalize_phone(value);
+    };
+    // Only permit address characters that are safe inside one vCard property.
+    let valid_local = local.len() <= 64
+        && local.split('.').all(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-/=?^_`{|}~".contains(&b))
+        });
+    let valid_domain = domain.contains('.')
+        && domain.split('.').all(|label| {
+            (1..=63).contains(&label.len())
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        });
+    if value.len() > 254 || !valid_local || !valid_domain {
+        return Err(io::Error::other("Проверь email для iMessage."));
+    }
+    Ok(value.to_owned())
 }
 fn escape_lines(text: &str, encode: bool) -> String {
     text.split("\r\n")
@@ -263,7 +290,13 @@ fn escape_lines(text: &str, encode: bool) -> String {
         .join("\r\n")
 }
 pub fn bmessage(recipient: &str, text: &str) -> io::Result<Vec<u8>> {
-    let phone = normalize_phone(recipient)?;
+    let recipient = normalize_recipient(recipient)?;
+    // iOS accepts Apple ID recipients as EMAIL in its SMS_GSM MAP channel.
+    let (originator, property) = if recipient.contains('@') {
+        ("BEGIN:VCARD\r\nVERSION:2.1\r\nN:\r\nEND:VCARD\r\n", "EMAIL")
+    } else {
+        ("", "TEL")
+    };
     let text = text
         .replace("\r\n", "\n")
         .replace('\r', "\n")
@@ -272,7 +305,7 @@ pub fn bmessage(recipient: &str, text: &str) -> io::Result<Vec<u8>> {
         return Err(io::Error::other("Введи сообщение не длиннее 12 КБ."));
     }
     let framed = format!("BEGIN:MSG\r\n{}\r\nEND:MSG\r\n", escape_lines(&text, true));
-    Ok(format!("BEGIN:BMSG\r\nVERSION:1.0\r\nSTATUS:UNREAD\r\nTYPE:SMS_GSM\r\nFOLDER:telecom/msg/outbox\r\nBEGIN:BENV\r\nBEGIN:VCARD\r\nVERSION:2.1\r\nN:\r\nTEL:{phone}\r\nEND:VCARD\r\nBEGIN:BBODY\r\nCHARSET:UTF-8\r\nLENGTH:{}\r\n{framed}END:BBODY\r\nEND:BENV\r\nEND:BMSG\r\n",framed.len()).into_bytes())
+    Ok(format!("BEGIN:BMSG\r\nVERSION:1.0\r\nSTATUS:UNREAD\r\nTYPE:SMS_GSM\r\nFOLDER:telecom/msg/outbox\r\n{originator}BEGIN:BENV\r\nBEGIN:VCARD\r\nVERSION:2.1\r\nN:\r\n{property}:{recipient}\r\nEND:VCARD\r\nBEGIN:BBODY\r\nCHARSET:UTF-8\r\nLENGTH:{}\r\n{framed}END:BBODY\r\nEND:BENV\r\nEND:BMSG\r\n",framed.len()).into_bytes())
 }
 pub fn extract_text(envelope: &str) -> io::Result<String> {
     let start = envelope
@@ -309,8 +342,25 @@ mod tests {
         assert_eq!(declared, envelope[first..last].len());
     }
     #[test]
+    fn apple_id_uses_email_in_the_recipient_vcard() {
+        let body = bmessage("  Parent+family@example.com  ", "Привет").unwrap();
+        let envelope = String::from_utf8(body).unwrap();
+        assert!(envelope.contains("TYPE:SMS_GSM\r\n"));
+        assert!(envelope.contains("BEGIN:BENV\r\nBEGIN:VCARD\r\nVERSION:2.1\r\nN:\r\nEMAIL:Parent+family@example.com\r\nEND:VCARD\r\n"));
+        assert_eq!(extract_text(&envelope).unwrap(), "Привет");
+    }
+    #[test]
     fn rejects_injection_and_malformed_packets() {
-        for value in ["+7999\r\nEND:VCARD", "abc", "+123", "test@example.com"] {
+        for value in [
+            "+7999\r\nEND:VCARD",
+            "abc",
+            "+123",
+            "person@",
+            "person@ex ample.com",
+            "person@example.com\r\nTEL:+79991234567",
+            "person@example.com,other@example.com",
+            "person@-example.com",
+        ] {
             assert!(bmessage(value, "test").is_err());
         }
         for packet in [

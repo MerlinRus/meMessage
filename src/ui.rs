@@ -1376,26 +1376,22 @@ impl MessagesApp {
                 self.connect();
             }
         }
-        let settings_button = icon_button(
-            ui,
-            Rect::from_min_size(pos2(rect.left() + 9., rect.bottom() - 31.), vec2(30., 26.)),
-            Icon::Settings,
-            "Настройки · Ctrl+,",
-            true,
-        );
+        let footer_y = rect.bottom() - 17.;
+        let settings = Rect::from_center_size(pos2(rect.left() + 24., footer_y), vec2(30., 26.));
+        let settings_button = icon_button(ui, settings, Icon::Settings, "Настройки · Ctrl+,", true);
         if settings_button.clicked() {
             self.open_settings();
         }
-        let center = pos2(rect.center().x + 12., rect.bottom() - 15.);
         let status = if self.preview {
             "Предпросмотр · без подключения"
         } else {
             &self.status
         };
-        let status_width = (rect.width() - 62.).max(1.);
-        let x = (center.x - status_width * 0.5).max(rect.left() + 43.);
+        let dot = pos2(settings.right() + 9., footer_y);
+        let text_x = dot.x + 8.;
+        let right = rect.right() - 10.;
         ui.painter().circle_filled(
-            pos2(x, center.y + 1.),
+            dot,
             2.5,
             if self.connected {
                 Color32::from_rgb(52, 199, 89)
@@ -1403,13 +1399,18 @@ impl MessagesApp {
                 Color32::from_rgb(153, 153, 160)
             },
         );
-        text_limit(
-            ui.painter(),
-            status,
-            pos2(x + 8., center.y - 6.),
-            status_width - 12.,
-            1,
+        let mut job = LayoutJob::simple(
+            status.to_owned(),
             FontId::proportional(10.5),
+            SECONDARY,
+            (right - text_x).max(1.),
+        );
+        job.wrap.max_rows = 1;
+        job.wrap.overflow_character = Some('…');
+        let galley = ui.painter().layout_job(job);
+        ui.painter().galley(
+            pos2(text_x, footer_y - galley.rect.center().y),
+            galley,
             SECONDARY,
         );
         let hint = if let Some(seconds) = self.reconnect_seconds {
@@ -1423,7 +1424,10 @@ impl MessagesApp {
             status.to_owned()
         };
         ui.interact(
-            Rect::from_min_max(pos2(x, rect.bottom() - 29.), rect.max),
+            Rect::from_min_max(
+                pos2(dot.x - 2.5, settings.top()),
+                pos2(right, settings.bottom()),
+            ),
             Id::new("connection_status"),
             Sense::hover(),
         )
@@ -3210,6 +3214,10 @@ mod scenario_tests {
                 h.app.connected && !h.app.connecting && !h.labels.contains_key("Подключить");
             h.app.preview = true;
             assert!(connected);
+            let status = h.text_rects["iPhone подключён"];
+            let settings = h.labels["Настройки · Ctrl+,"];
+            assert!((status.center().y - settings.center().y).abs() < 1.);
+            assert!(status.left() > settings.right());
         }
     }
     #[test]

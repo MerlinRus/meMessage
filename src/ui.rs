@@ -692,10 +692,25 @@ impl MessagesApp {
         if let Some(phone) = self.contact_phone() {
             ui.label(RichText::new(self.contacts.display(&phone, &self.name())).strong());
             ui.label(
-                RichText::new(model::format_phone(&phone))
+                RichText::new(format!("Получатель: {}", model::format_phone(&phone)))
                     .small()
                     .color(SECONDARY),
             );
+            let related = self.contacts.related_addresses(&phone);
+            if !related.is_empty() {
+                ui.label(
+                    RichText::new("Другие адреса контакта")
+                        .small()
+                        .color(SECONDARY),
+                );
+                for address in related.iter().filter(|address| *address != &phone) {
+                    ui.label(
+                        RichText::new(model::format_phone(address))
+                            .small()
+                            .color(SECONDARY),
+                    );
+                }
+            }
             ui.add_space(8.);
             ui.horizontal(|ui| {
                 let (rect, _) = ui.allocate_exact_size(vec2(44., 44.), Sense::hover());

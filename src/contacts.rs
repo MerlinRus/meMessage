@@ -14,6 +14,8 @@ pub struct Book {
     #[serde(default)]
     pub imported: BTreeMap<String, String>,
     #[serde(default)]
+    pub linked_addresses: Vec<Vec<String>>,
+    #[serde(default)]
     pub aliases: BTreeMap<String, String>,
     #[serde(default)]
     pub photos: BTreeMap<String, Vec<u8>>,
@@ -70,15 +72,23 @@ impl Book {
             c.name = self.display(&c.phone, &c.name);
         }
     }
+
+    pub fn related_addresses(&self, address: &str) -> &[String] {
+        let address = model::key(address);
+        self.linked_addresses
+            .iter()
+            .find(|group| group.contains(&address))
+            .map_or(&[], Vec::as_slice)
+    }
 }
 
 fn variable_header(id: u8, value: &[u8]) -> Vec<u8> {
     let len = (value.len() + 3) as u16;
     [&[id, (len >> 8) as u8, len as u8], value].concat()
 }
-pub fn pull(address: u64) -> io::Result<BTreeMap<String, String>> {
+pub fn pull(address: u64) -> io::Result<Book> {
     let book = pull_with(Transport::connect_service(address, 0x112f)?)?;
-    if book.is_empty() {
+    if book.imported.is_empty() && book.linked_addresses.is_empty() {
         Err(io::Error::other(
             "iPhone вернул пустую телефонную книгу. Включи «Синхронизация контактов» в Bluetooth на телефоне и повтори.",
         ))
@@ -86,12 +96,12 @@ pub fn pull(address: u64) -> io::Result<BTreeMap<String, String>> {
         Ok(book)
     }
 }
-fn pull_with(transport: impl Exchange) -> io::Result<BTreeMap<String, String>> {
+fn pull_with(transport: impl Exchange) -> io::Result<Book> {
     Ok(parse_vcards(&pull_raw(transport)?))
 }
 pub fn probe(address: u64) -> io::Result<serde_json::Value> {
     let text = pull_raw(Transport::connect_service(address, 0x112f)?)?;
-    let numbers = parse_vcards(&text);
+    let book = parse_vcards(&text);
     let cached = model::load(&model::data_path()).unwrap_or_default();
     let phones: std::collections::BTreeSet<_> = cached
         .iter()
@@ -99,10 +109,10 @@ pub fn probe(address: u64) -> io::Result<serde_json::Value> {
         .collect();
     let matched = phones
         .iter()
-        .filter(|phone| numbers.contains_key(*phone))
+        .filter(|phone| book.imported.contains_key(*phone))
         .count();
     Ok(
-        serde_json::json!({"bytes":text.len(),"cards":text.matches("BEGIN:VCARD").count(),"numbers":numbers.len(),"matched_conversations":matched}),
+        serde_json::json!({"bytes":text.len(),"cards":text.matches("BEGIN:VCARD").count(),"addresses":book.imported.len(),"matched_conversations":matched}),
     )
 }
 fn pull_raw(mut transport: impl Exchange) -> io::Result<String> {
@@ -126,8 +136,8 @@ fn pull_raw(mut transport: impl Exchange) -> io::Result<String> {
         .chain(Some(0))
         .flat_map(u16::to_be_bytes)
         .collect();
-    // Request names and telephone numbers only; do not transfer contact photos.
-    let params = [6, 8, 0, 0, 0, 0, 0, 0, 0, 0x86, 7, 1, 1, 4, 2, 0x27, 0x10];
+    // PBAP PropertySelector: FN, N, TEL and EMAIL.
+    let params = [6, 8, 0, 0, 0, 0, 0, 0, 1, 0x86, 7, 1, 1, 4, 2, 0x27, 0x10];
     let first = [
         connection.clone(),
         variable_header(1, &name),
@@ -207,7 +217,7 @@ fn quoted_printable(value: &str) -> String {
     }
     String::from_utf8_lossy(&out).into_owned()
 }
-pub fn parse_vcards(text: &str) -> BTreeMap<String, String> {
+fn parse_vcards(text: &str) -> Book {
     let mut lines: Vec<String> = Vec::new();
     for line in text.lines() {
         if let Some(last) = lines.last_mut() {
@@ -223,13 +233,14 @@ pub fn parse_vcards(text: &str) -> BTreeMap<String, String> {
         }
         lines.push(line.trim_end_matches('\r').into());
     }
-    let mut result = BTreeMap::new();
-    let (mut full, mut parts, mut phones) = (String::new(), String::new(), Vec::<String>::new());
+    let mut book = Book::default();
+    let mut counts = BTreeMap::<String, usize>::new();
+    let (mut full, mut parts, mut addresses) = (String::new(), String::new(), Vec::<String>::new());
     for line in lines {
         if line.eq_ignore_ascii_case("BEGIN:VCARD") {
             full.clear();
             parts.clear();
-            phones.clear();
+            addresses.clear();
             continue;
         }
         if line.eq_ignore_ascii_case("END:VCARD") {
@@ -238,10 +249,17 @@ pub fn parse_vcards(text: &str) -> BTreeMap<String, String> {
             } else {
                 full.trim()
             };
-            if !name.is_empty() {
-                for phone in &phones {
-                    result.insert(phone.clone(), name.to_owned());
+            addresses.sort_unstable();
+            addresses.dedup();
+            for address in &addresses {
+                *counts.entry(address.clone()).or_default() += 1;
+                if !name.is_empty() {
+                    book.imported.insert(address.clone(), name.to_owned());
                 }
+            }
+            let group = std::mem::take(&mut addresses);
+            if group.len() > 1 {
+                book.linked_addresses.push(group);
             }
             continue;
         }
@@ -278,13 +296,26 @@ pub fn parse_vcards(text: &str) -> BTreeMap<String, String> {
                         .strip_prefix('+')
                         .is_some_and(|digits| digits.bytes().all(|b| b.is_ascii_digit()))
                 {
-                    phones.push(phone);
+                    addresses.push(phone);
+                }
+            }
+            "EMAIL" => {
+                if value.contains('@')
+                    && let Ok(email) = map::normalize_recipient(&unescape(&value))
+                {
+                    addresses.push(model::key(&email));
                 }
             }
             _ => {}
         }
     }
-    result
+    // A shared address cannot identify which card the chat belongs to.
+    book.imported.retain(|address, _| counts[address] == 1);
+    for group in &mut book.linked_addresses {
+        group.retain(|address| counts[address] == 1);
+    }
+    book.linked_addresses.retain(|group| group.len() > 1);
+    book
 }
 
 #[cfg(test)]
@@ -295,9 +326,27 @@ mod tests {
         let book = parse_vcards(
             "BEGIN:VCARD\r\nFN:Полина ❤️\\, любимая\r\nTEL;CELL:+7 (999) 123-45-67\r\nitem1.TEL:89997654321\r\nEND:VCARD\r\nBEGIN:VCARD\r\nN:Иванов;Иван;;;\r\nTEL:+79990000000\r\nEND:VCARD",
         );
-        assert_eq!(book.len(), 3);
-        assert_eq!(book["+79991234567"], "Полина ❤️, любимая");
-        assert_eq!(book["+79990000000"], "Иванов Иван");
+        assert_eq!(book.imported.len(), 3);
+        assert_eq!(book.imported["+79991234567"], "Полина ❤️, любимая");
+        assert_eq!(book.imported["+79990000000"], "Иванов Иван");
+    }
+    #[test]
+    fn links_email_by_card_and_ignores_addresses_shared_by_distinct_cards() {
+        let book = parse_vcards(concat!(
+            "BEGIN:VCARD\r\nFN:Мама\r\nTEL:+79991234567\r\n",
+            "item1.EMAIL;TYPE=HOME:Parent@EXAMPLE.COM\r\n",
+            "EMAIL:shared@example.com\r\nEND:VCARD\r\n",
+            "BEGIN:VCARD\r\nFN:Мама\r\nTEL:+79990000000\r\n",
+            "EMAIL:shared@example.com\r\nEND:VCARD\r\n",
+        ));
+        assert_eq!(book.display("parent@example.com", ""), "Мама");
+        assert_eq!(book.display("+79991234567", ""), "Мама");
+        assert_eq!(
+            book.related_addresses("parent@example.com"),
+            ["+79991234567", "parent@example.com"]
+        );
+        assert!(book.related_addresses("+79990000000").is_empty());
+        assert!(!book.imported.contains_key("shared@example.com"));
     }
     #[test]
     fn manual_names_override_import_and_survive_encrypted_reload() {
@@ -359,7 +408,13 @@ mod tests {
                         Ok(vec![0xa0, 0, 7, 0x10, 0, 0x10, 0])
                     }
                     2 => {
-                        assert!(p.windows(4).any(|w| w == [6, 8, 0, 0]));
+                        let app = map::headers(p, 3)
+                            .unwrap()
+                            .into_iter()
+                            .find(|(id, _)| *id == 0x4c)
+                            .unwrap()
+                            .1;
+                        assert_eq!(&app[..10], &[6, 8, 0, 0, 0, 0, 0, 0, 1, 0x86]);
                         Ok(variable_header(
                             0x90,
                             &variable_header(0x48, b"BEGIN:VCARD\r\nFN:Anna\r\n"),
@@ -367,12 +422,16 @@ mod tests {
                     }
                     _ => Ok(variable_header(
                         0xa0,
-                        &variable_header(0x49, b"TEL:+79991234567\r\nEND:VCARD\r\n"),
+                        &variable_header(
+                            0x49,
+                            b"TEL:+79991234567\r\nEMAIL:anna@example.com\r\nEND:VCARD\r\n",
+                        ),
                     )),
                 }
             }
         }
         let book = pull_with(Fake { step: 0 }).unwrap();
-        assert_eq!(book["+79991234567"], "Anna");
+        assert_eq!(book.imported["+79991234567"], "Anna");
+        assert_eq!(book.imported["anna@example.com"], "Anna");
     }
 }

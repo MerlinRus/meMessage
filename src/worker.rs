@@ -324,7 +324,8 @@ pub fn start(
                         .lock()
                         .map_err(|_| io::Error::other("Контакты заняты."))?;
                     let mut updated = shared.clone();
-                    updated.imported = imported;
+                    updated.imported = imported.imported;
+                    updated.linked_addresses = imported.linked_addresses;
                     updated.save(&contacts::path())?;
                     *shared = updated.clone();
                     Ok(updated)
@@ -335,7 +336,7 @@ pub fn start(
                     emit(Event::Contacts(book));
                     emit(Event::ContactsStatus(
                         false,
-                        format!("Контакты iPhone: {count} номеров."),
+                        format!("Адресов из контактов iPhone: {count}."),
                     ));
                 }
                 Err(error) => emit(Event::ContactsStatus(false, error.to_string())),
